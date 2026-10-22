@@ -10,8 +10,9 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushB
                                QStyledItemDelegate, QStyle)
 from PySide6.QtCore import Qt, QSettings, QUrl
 from PySide6.QtGui import QDesktopServices, QColor, QPainter
-from db_config import get_conn
+from db_config import get_conn, get_current_user
 from ui_components import CenteredCheckBoxDelegate
+from app_paths import get_user_dir
 
 
 class ElidedLabel(QLabel):
@@ -40,7 +41,7 @@ class ElidedLabel(QLabel):
 
 # ================= ID 列专用 delegate：离开单元格立即标红 =================
 class IdDelegate(QStyledItemDelegate):
-    """平台ID / 百度ID：通过重写 paint 绕过 QSS 限制，实现在选中状态下依然显示红底红字"""
+    """平台ID / 百度CP号：通过重写 paint 绕过 QSS 限制，实现在选中状态下依然显示红底红字"""
     INVALID_BG = QColor("#FADBD8")
     INVALID_BG_SELECTED = QColor("#F4C2C2")  # 选中时稍深的红色
     INVALID_FG = QColor("#C0392B")
@@ -179,10 +180,18 @@ class EvidenceWidget(QWidget):
                 return
 
             try:
-                base_dir = os.path.dirname(os.path.abspath(__file__))
-                data_dir = os.path.join(base_dir, "evidences_data")
+                # ★ 修改开始：获取当前用户专属目录
+                user_id = get_current_user()
+                if user_id:
+                    data_dir = os.path.join(get_user_dir(user_id), "evidences")
+                else:
+                    # 开发模式未登录时的兜底目录
+                    base_dir = os.path.dirname(os.path.abspath(__file__))
+                    data_dir = os.path.join(base_dir, "evidences_data")
+
                 if not os.path.exists(data_dir):
                     os.makedirs(data_dir)
+                # ★ 修改结束
 
                 prefix_id = platform_id if platform_id else f"book_{db_id}"
                 safe_prefix = re.sub(r'[\\/:*?"<>|]', '_', prefix_id)
@@ -217,7 +226,9 @@ class EvidenceWidget(QWidget):
             conn.close()
         if shared:
             return
-        if "evidences_data" not in old_path:
+
+        # ★ 修改：兼容新目录 (evidences) 和旧目录 (evidences_data)
+        if "evidences" not in old_path.lower() and "evidences_data" not in old_path.lower():
             return
         try:
             os.remove(old_path)
@@ -323,7 +334,7 @@ class ImportBooksDialog(QDialog):
             ws = wb.active
             ws.title = "作品列表"
 
-            headers = ["平台ID(必填)", "作品名(必填)", "作品曾用名", "笔名", "权利人(必填)", "百度ID(必填)"]
+            headers = ["平台ID(必填)", "作品名(必填)", "作品曾用名", "笔名", "权利人(必填)", "百度CP号(必填)"]
             for col, header in enumerate(headers, 1):
                 ws.cell(row=1, column=col, value=header)
 
@@ -421,7 +432,7 @@ class ImportBooksDialog(QDialog):
 
         msg = f"成功导入 {success_count} 部作品！\n跳过重复 {duplicate_count} 部。"
         if invalid_count > 0:
-            msg += f"\n\n⚠️ 有 {invalid_count} 条记录因【平台ID/百度ID 含非法字符】被跳过（仅支持英文字母和数字）。"
+            msg += f"\n\n⚠️ 有 {invalid_count} 条记录因【平台ID/百度CP号 含非法字符】被跳过（仅支持英文字母和数字）。"
         QMessageBox.information(self, "导入完成", msg)
         self.accept()
 
@@ -449,7 +460,7 @@ class BooksPage(QWidget):
         tool_layout = QHBoxLayout()
         tool_layout.setSpacing(10)
 
-        tip_label = QLabel("💡 平台ID/百度ID 仅支持英文字母和数字，非法会立即标红。")
+        tip_label = QLabel("💡 平台ID/百度CP号 仅支持英文字母和数字，非法会立即标红。")
         tip_label.setStyleSheet("color: #666;")
         tip_label.setWordWrap(False)
         tool_layout.addWidget(tip_label)
@@ -462,6 +473,18 @@ class BooksPage(QWidget):
             }
             QPushButton:hover { background-color: #F5F5F5; }
         """
+
+        # ★ 新增：➕ 新增作品（显式入口）
+        add_btn = QPushButton("➕ 新增空白行")
+        add_btn.setStyleSheet("""
+            QPushButton { 
+                background-color: #FFFFFF; color: #00B87C; border: 1px solid #00B87C; 
+                border-radius: 4px; padding: 6px 12px; font-weight: bold;
+            }
+            QPushButton:hover { background-color: #F0FFF8; }
+        """)
+        add_btn.clicked.connect(self.add_new_row)
+        tool_layout.addWidget(add_btn)
 
         make_evidence_btn = QPushButton("制作维权书（单选）")
         make_evidence_btn.setStyleSheet("""
@@ -498,7 +521,7 @@ class BooksPage(QWidget):
 
         self.table.setHorizontalHeaderLabels(
             ["选择", "平台ID(必填)", "作品名(必填)", "作品曾用名", "笔名", "权利人(必填)",
-             "百度ID(必填)", "维权书(必填)"])
+             "百度CP号(必填)", "维权书(必填)"])
 
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.Stretch)
@@ -618,33 +641,65 @@ class BooksPage(QWidget):
                 else:
                     ep.book_tab.book_combo.setCurrentIndex(idx)
 
+    # ==================== 新增：加号按钮 + 焦点找回 ====================
+    def add_new_row(self):
+        """『➕ 新增作品』按钮：复用末尾空白行，或新加一行并聚焦。"""
+        last = self.table.rowCount() - 1
+        if last >= 0:
+            id_item = self.table.item(last, 1)
+            name_item = self.table.item(last, 2)
+            # 末尾已经是"未保存的空白行" → 不重复添加，直接聚焦
+            if (id_item and not id_item.data(Qt.UserRole)
+                    and name_item and not name_item.text().strip()):
+                self.table.setCurrentCell(last, 1)
+                self.table.scrollToBottom()
+                return
+
+        self.add_blank_row(set_focus=True)
+        self.table.scrollToBottom()
+
+    def _focus_row_by_db_id(self, db_id):
+        """refresh_table 之后，把当前行定位到指定 db_id 的那一行。"""
+        target = str(db_id)
+        for r in range(self.table.rowCount()):
+            item = self.table.item(r, 1)
+            if item and str(item.data(Qt.UserRole)) == target:
+                self.table.setCurrentCell(r, 1)  # 定位到"平台ID"列，方便继续填
+                self.table.scrollToItem(item, QAbstractItemView.PositionAtCenter)
+                return
+
+    # ================================================================
+
     def add_blank_row(self, set_focus=False):
+        # ★ 保存现场：外层可能已处于 blockSignals / _is_updating 状态，不能冲掉
+        prev_updating = self._is_updating
+        prev_blocked = self.table.blockSignals(True)
         self._is_updating = True
-        self.table.blockSignals(True)
-        row = self.table.rowCount()
-        self.table.insertRow(row)
+        try:
+            row = self.table.rowCount()
+            self.table.insertRow(row)
 
-        chk_item = QTableWidgetItem()
-        chk_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-        chk_item.setCheckState(Qt.Unchecked)
-        chk_item.setData(Qt.UserRole, "")
-        self.table.setItem(row, 0, chk_item)
+            chk_item = QTableWidgetItem()
+            chk_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            chk_item.setCheckState(Qt.Unchecked)
+            chk_item.setData(Qt.UserRole, "")
+            self.table.setItem(row, 0, chk_item)
 
-        id_item = QTableWidgetItem("")
-        id_item.setData(Qt.UserRole, "")
-        self.table.setItem(row, 1, id_item)
+            id_item = QTableWidgetItem("")
+            id_item.setData(Qt.UserRole, "")
+            self.table.setItem(row, 1, id_item)
 
-        for i in range(2, 7):
-            self.table.setItem(row, i, QTableWidgetItem(""))
+            for i in range(2, 7):
+                self.table.setItem(row, i, QTableWidgetItem(""))
 
-        evidence_widget = EvidenceWidget("", self, row)
-        self.table.setCellWidget(row, 7, evidence_widget)
+            evidence_widget = EvidenceWidget("", self, row)
+            self.table.setCellWidget(row, 7, evidence_widget)
 
-        self.table.blockSignals(False)
-        self._is_updating = False
-
-        if set_focus:
-            self.table.setCurrentCell(row, 1)
+            if set_focus:
+                self.table.setCurrentCell(row, 1)
+        finally:
+            self.table.blockSignals(prev_blocked)
+            self._is_updating = prev_updating
 
     def delete_book(self):
         rows_to_delete = []
@@ -698,6 +753,8 @@ class BooksPage(QWidget):
         id_item = self.table.item(row, 1)
         db_id = id_item.data(Qt.UserRole) if id_item else ""
 
+        new_id = None  # ★ 记录新建时拿到的 rowid，用于 refresh 后定位
+
         conn = get_conn()
         cursor = conn.cursor()
         try:
@@ -714,9 +771,6 @@ class BooksPage(QWidget):
                     chk.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
                     chk.setData(Qt.UserRole, new_id)
                 self.table.blockSignals(False)
-
-                if row == self.table.rowCount() - 1:
-                    self.add_blank_row(set_focus=False)
             else:
                 cursor.execute(
                     "UPDATE books SET platform_id=?, baidu_id=?, name=?, pen_name=?, aliases=?, rights_holder=? WHERE id=?",
@@ -724,7 +778,7 @@ class BooksPage(QWidget):
                 conn.commit()
         except sqlite3.IntegrityError as e:
             if "CHECK" in str(e).upper():
-                QMessageBox.warning(self.window(), "格式错误", "平台ID / 百度ID 仅支持英文字母和数字！")
+                QMessageBox.warning(self.window(), "格式错误", "平台ID / 百度CP号 仅支持英文字母和数字！")
                 self.refresh_table()
             else:
                 QMessageBox.warning(self.window(), "冲突", "作品名不能重复！")
@@ -733,6 +787,8 @@ class BooksPage(QWidget):
 
         if not db_id:
             self.refresh_table()
+            if new_id:
+                self._focus_row_by_db_id(new_id)  # ★ 重建后定位回刚新建的那条
 
     def refresh_table(self):
         self._is_updating = True

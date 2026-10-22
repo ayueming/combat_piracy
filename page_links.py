@@ -1,6 +1,7 @@
 import sqlite3
 import os
 import subprocess
+import json
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
                                QHeaderView, QMessageBox, QButtonGroup, QAbstractItemView,
                                QFileDialog, QTableView, QApplication, QDialog, QGroupBox,
@@ -55,7 +56,6 @@ class LinksTableView(QTableView):
                 model = self.model()
                 if index.column() == 9:
                     comp_time = model.index(index.row(), 8).data()  # 第8列是投诉时间
-                    # 纯靠投诉时间判断：如果有投诉时间，说明已完成，禁止编辑资源状态
                     if comp_time and str(comp_time).strip():
                         return
 
@@ -97,15 +97,13 @@ class BookComboDelegate(QStyledItemDelegate):
         combo.setStyleSheet("QComboBox { border: 1px solid #ccc; padding-left: 5px; background: #fff; }")
         combo.setFocusPolicy(Qt.StrongFocus)
 
-        # ★ 只加真实作品，不加空白和暂不关联
         for _, name, _, _ in self.book_list:
             combo.addItem(name, name)
 
         if combo.count() > 0:
-            # 修复文字截断留白
             combo.view().setTextElideMode(Qt.ElideNone)
             combo.view().setMinimumWidth(combo.view().sizeHintForColumn(0) + 20)
-            QTimer.singleShot(10, combo.showPopup)  # 自动展开
+            QTimer.singleShot(10, combo.showPopup)
         return combo
 
     def setEditorData(self, editor, index):
@@ -146,15 +144,13 @@ class CategoryComboDelegate(QStyledItemDelegate):
         combo.setStyleSheet("QComboBox { border: 1px solid #ccc; padding-left: 5px; background: #fff; }")
         combo.setFocusPolicy(Qt.StrongFocus)
 
-        # ★ 只加固定分类，不加空字符串
         cats = ["百度网盘", "百度知道", "百度贴吧", "百度搜索", "夸克网盘", "夸克搜索", "uc网盘", "其他"]
         for c in cats:
             combo.addItem(c, c)
 
-        # 修复文字截断留白
         combo.view().setTextElideMode(Qt.ElideNone)
         combo.view().setMinimumWidth(combo.view().sizeHintForColumn(0) + 20)
-        QTimer.singleShot(10, combo.showPopup)  # 自动展开
+        QTimer.singleShot(10, combo.showPopup)
         return combo
 
     def setEditorData(self, editor, index):
@@ -192,9 +188,9 @@ class StatusComboDelegate(QStyledItemDelegate):
 
     def createEditor(self, parent, option, index):
         model = index.model()
-        comp_time = model.index(index.row(), 8).data()  # 索引8是投诉时间
+        comp_time = model.index(index.row(), 8).data()
         if comp_time and str(comp_time).strip():
-            return None  # 有投诉时间，说明已完成，禁止编辑
+            return None
 
         combo = NoWheelComboBox(parent)
         combo.setStyleSheet("QComboBox { border: 1px solid #ccc; padding-left: 5px; background: #fff; }")
@@ -203,15 +199,13 @@ class StatusComboDelegate(QStyledItemDelegate):
         combo.addItem("（空白）", "")
         combo.addItem("已失效", "已失效")
 
-        # 修复文字截断留白
         combo.view().setTextElideMode(Qt.ElideNone)
         combo.view().setMinimumWidth(combo.view().sizeHintForColumn(0) + 20)
         QTimer.singleShot(10, combo.showPopup)
         return combo
 
     def setEditorData(self, editor, index):
-        if not editor:
-            return
+        if not editor: return
         text = index.data(Qt.DisplayRole)
         if not text or str(text).strip() == "":
             text = "（空白）"
@@ -220,11 +214,9 @@ class StatusComboDelegate(QStyledItemDelegate):
             editor.setCurrentIndex(idx)
 
     def setModelData(self, editor, model, index):
-        if not editor:
-            return
+        if not editor: return
         val = editor.currentData()
-        if val is None:
-            val = ""
+        if val is None: val = ""
         model.setData(index, val, Qt.EditRole)
 
     def paint(self, painter, option, index):
@@ -324,8 +316,7 @@ class ImportLinksDialog(QDialog):
 
     def download_template(self):
         path, _ = QFileDialog.getSaveFileName(self, "保存链接导入模板", "链接导入模板.xlsx", "Excel 文件 (*.xlsx)")
-        if not path:
-            return
+        if not path: return
         try:
             import openpyxl
             from openpyxl import Workbook
@@ -348,8 +339,7 @@ class ImportLinksDialog(QDialog):
     def upload_file(self):
         path, _ = QFileDialog.getOpenFileName(self, "选择导入文件", "",
                                               "表格文件 (*.csv *.xlsx);;CSV 文件 (*.csv);;Excel 文件 (*.xlsx)")
-        if not path:
-            return
+        if not path: return
 
         try:
             success, duplicate = import_sites_from_file(path)
@@ -371,7 +361,7 @@ class LinksPage(QWidget):
             "全部链接": ["全部资源"],
             "百度投诉": ["百度搜索", "百度网盘", "百度知道", "百度贴吧"],
             "夸克投诉": ["夸克搜索", "夸克网盘"],
-            "UC投诉": ["uc网盘"],
+            "uc投诉": ["uc网盘"],
             "百度搜索": ["百度搜索"],
             "百度网盘": ["百度网盘"],
             "百度知道": ["百度知道"],
@@ -384,6 +374,11 @@ class LinksPage(QWidget):
 
         self.book_list = []
         self._is_updating = False
+
+        # ★ 筛选持久化数据结构
+        self._current_cat = "全部链接"
+        self.filters_by_cat = {}
+
         self.setup_ui()
 
     def setup_ui(self):
@@ -481,6 +476,11 @@ class LinksPage(QWidget):
 
         action_layout.addStretch()
 
+        # ★ 新增：右上角统计提示条
+        self.stats_label = QLabel("")
+        self.stats_label.setStyleSheet("color: #666; font-size: 13px;")
+        action_layout.addWidget(self.stats_label)
+
         self.report_btn = QPushButton(" 一键发起投诉 (勾选)")
         self.report_btn.setStyleSheet("""
             QPushButton { background-color: #E74C3C; color: white; padding: 6px 16px; border-radius: 4px; font-weight: bold; } 
@@ -526,6 +526,9 @@ class LinksPage(QWidget):
         self.proxy_model = ExcelFilterProxyModel(self)
         self.proxy_model.setSourceModel(self.model)
 
+        # ★ 信号绑定：用户点筛选弹窗“确定”或重置筛选时，触发保存和统计更新
+        self.proxy_model.filterChanged.connect(self._on_filter_changed)
+
         self.table = LinksTableView()
         self.table.setModel(self.proxy_model)
 
@@ -566,38 +569,165 @@ class LinksPage(QWidget):
 
         layout.addWidget(self.table, 1)
 
-        self.cat_group.buttonClicked.connect(self.refresh_table)
+        # ★ 1. 监听列宽变化并恢复
+        self.table.horizontalHeader().sectionResized.connect(self._save_column_widths)
+        self._load_column_widths()
+
+        # ★ 2. 监听分类按钮点击 (不再直接 connect refresh_table，而是走独立槽函数)
+        self.cat_group.buttonClicked.connect(self._on_cat_clicked)
+
+        # ★ 3. 恢复分类按钮状态和筛选状态
+        self._load_ui_state()
+
         self.refresh_books()
         self.refresh_table()
 
+    # ================= 状态持久化：列宽 =================
+    def _save_column_widths(self):
+        if not hasattr(self, '_col_width_timer'):
+            self._col_width_timer = QTimer(self)
+            self._col_width_timer.setSingleShot(True)
+            self._col_width_timer.timeout.connect(self._do_save_column_widths)
+        self._col_width_timer.start(400)
+
+    def _do_save_column_widths(self):
+        header = self.table.horizontalHeader()
+        widths = {}
+        for col in range(self.model.columnCount()):
+            if col == 3: continue
+            widths[str(col)] = header.sectionSize(col)
+        self.settings.setValue("links_col_widths", json.dumps(widths))
+
+    def _load_column_widths(self):
+        raw = self.settings.value("links_col_widths", "")
+        if raw:
+            try:
+                widths = json.loads(raw)
+                header = self.table.horizontalHeader()
+                header.blockSignals(True)
+                for col_str, width in widths.items():
+                    col = int(col_str)
+                    if col != 3:
+                        header.resizeSection(col, width)
+                header.blockSignals(False)
+            except Exception:
+                pass
+
+    # ================= 状态持久化：分类与筛选 =================
+    def _load_ui_state(self):
+        # 1. 恢复当前分类按钮
+        self._current_cat = self.settings.value("links_current_cat", "全部链接")
+        for btn in self.cat_group.buttons():
+            if btn.text() == self._current_cat:
+                btn.setChecked(True)
+                break
+        else:
+            # 如果没找到 (比如旧版本的名字)，回退到全部链接
+            self.cat_group.buttons()[0].setChecked(True)
+            self._current_cat = "全部链接"
+
+        # 2. 恢复所有分类的筛选字典
+        raw = self.settings.value("links_filters_by_cat", "")
+        if raw:
+            try:
+                self.filters_by_cat = json.loads(raw)
+            except Exception:
+                self.filters_by_cat = {}
+
+        # 3. 将当前分类的筛选应用到 proxy
+        self._apply_filters_to_proxy()
+
+    def _on_cat_clicked(self, btn):
+        new_cat = btn.text()
+        if new_cat == self._current_cat:
+            return
+
+        # 先更新当前分类
+        self._current_cat = new_cat
+
+        # 从内存字典中取出新分类的筛选并应用
+        self._apply_filters_to_proxy()
+
+        # 保存当前分类名到 QSettings
+        self.settings.setValue("links_current_cat", self._current_cat)
+
+        # 刷新表格
+        self.refresh_table()
+
+    def _apply_filters_to_proxy(self):
+        """把 self.filters_by_cat[self._current_cat] 里的数据应用到 proxy_model"""
+        self._is_updating = True
+        # 先把原来的清掉
+        self.proxy_model.filter_dict.clear()
+
+        # 取出当前分类的筛选字典 (格式: {"列index": [允许的值...]})
+        cat_filter = self.filters_by_cat.get(self._current_cat, {})
+        for col_str, allowed_list in cat_filter.items():
+            self.proxy_model.filter_dict[int(col_str)] = set(allowed_list)
+
+        self.proxy_model.invalidateFilter()
+        # 强制刷新表头
+        self.table.horizontalHeader().viewport().update()
+        self._is_updating = False
+
+    def _on_filter_changed(self):
+        """用户点击了筛选弹窗的确定，或者点了清空"""
+        if self._is_updating:
+            return
+
+        # 1. 把 proxy 当前的 filter_dict 转成可以被 JSON 序列化的格式
+        current_filter = {}
+        for col, allowed_set in self.proxy_model.filter_dict.items():
+            current_filter[str(col)] = list(allowed_set)
+
+        # 2. 存入内存字典
+        self.filters_by_cat[self._current_cat] = current_filter
+
+        # 3. 写入 QSettings
+        self.settings.setValue("links_filters_by_cat", json.dumps(self.filters_by_cat))
+
+        # 4. 更新右上角统计条
+        self._update_stats()
+
+    # ================= 统计条更新 =================
+    def _update_stats(self):
+        total_count = max(0, self.model.rowCount() - 15)
+        visible_count = max(0, self.proxy_model.rowCount() - 15)
+        has_filter = bool(self.proxy_model.filter_dict)
+
+        if not has_filter:
+            self.stats_label.setText(f"共 {total_count} 条链接")
+            self.stats_label.setStyleSheet("color: #666; font-size: 13px;")
+        elif visible_count == 0:
+            self.stats_label.setText(f"⚠️ 当前筛选无结果 (共 {total_count} 条)")
+            self.stats_label.setStyleSheet("color: #E74C3C; font-size: 13px; font-weight: bold;")
+        else:
+            self.stats_label.setText(f"筛选结果: {visible_count} / {total_count} 条")
+            self.stats_label.setStyleSheet("color: #10B981; font-size: 13px; font-weight: bold;")
+
+    # ================= 其他原有逻辑 =================
     def open_import_dialog(self):
         dialog = ImportLinksDialog(self)
         dialog.exec()
 
     def export_to_excel(self):
-        # 1. 找出所有被勾选的行
         checked_rows = []
         for row in range(self.model.rowCount()):
             chk_item = self.model.item(row, 0)
             if chk_item and chk_item.checkState() == Qt.Checked:
                 url_item = self.model.item(row, 3)
-                # 确保有链接内容才导出（排除末尾的空白占位行）
                 if url_item and url_item.text().strip():
                     checked_rows.append(row)
 
-        # 2. 如果一条都没勾选，直接拦截
         if not checked_rows:
             QMessageBox.warning(self, "提示", "请先在左侧勾选需要导出的数据！")
             return
 
-        # 3. 弹窗选择保存路径
-        current_display = self.cat_group.checkedButton().text()
+        current_display = self._current_cat
         default_name = f"盗版链接导出_{current_display}.xlsx"
         path, _ = QFileDialog.getSaveFileName(self, "保存Excel文件", default_name, "Excel 文件 (*.xlsx)")
-        if not path:
-            return
+        if not path: return
 
-        # 4. 写入 Excel
         try:
             import openpyxl
             from openpyxl import Workbook
@@ -607,14 +737,12 @@ class LinksPage(QWidget):
             ws = wb.active
             ws.title = "盗版链接"
 
-            # 表头（与导入模板兼容）
             headers = ["关联作品(必填)", "资源分类", "资源链接(必填)", "名称", "属性", "投诉时间", "状态"]
             for col_idx, header in enumerate(headers, 1):
                 cell = ws.cell(row=1, column=col_idx, value=header)
                 cell.font = Font(bold=True)
                 cell.alignment = Alignment(horizontal="center")
 
-            # 只写入勾选的行
             for row_idx, r in enumerate(checked_rows, start=2):
                 book_name = self.model.item(r, 1).text().strip()
                 cat = self.model.item(r, 2).text().strip()
@@ -632,7 +760,6 @@ class LinksPage(QWidget):
                 ws.cell(row=row_idx, column=6, value=comp_time)
                 ws.cell(row=row_idx, column=7, value=res_status)
 
-            # 设置列宽
             ws.column_dimensions['A'].width = 20
             ws.column_dimensions['B'].width = 15
             ws.column_dimensions['C'].width = 50
@@ -642,20 +769,14 @@ class LinksPage(QWidget):
             ws.column_dimensions['G'].width = 15
 
             wb.save(path)
-
-            # 成功提示
             QMessageBox.information(self, "导出成功", f"已成功导出 {len(checked_rows)} 条勾选数据！")
-
-            # 顺手打开文件所在的文件夹
             folder_path = os.path.dirname(path)
             subprocess.Popen(f'explorer "{folder_path}"')
-
         except Exception as e:
             QMessageBox.critical(self, "导出失败", f"生成 Excel 时出错：{e}")
 
     def on_selection_changed(self, selected, deselected):
-        if self._is_updating:
-            return
+        if self._is_updating: return
 
         selected_rows = set(idx.row() for idx in selected.indexes())
         deselected_rows = set(idx.row() for idx in deselected.indexes())
@@ -698,8 +819,7 @@ class LinksPage(QWidget):
             if len(missing_rows) > 10:
                 rows_text += " 等"
             QMessageBox.critical(
-                self,
-                "⛔ 拦截：必填项缺失",
+                self, "⛔ 拦截：必填项缺失",
                 f"检测到以下行存在必填项未填写：\n\n👉 第 {rows_text} 行\n\n"
                 f"请把红底单元格补充完整后再发起投诉！"
             )
@@ -714,8 +834,7 @@ class LinksPage(QWidget):
         if missing_books:
             missing_str = "、".join(missing_books)
             QMessageBox.critical(
-                self,
-                "⛔ 拦截：作品信息不完整",
+                self, "⛔ 拦截：作品信息不完整",
                 f"检测到以下作品未配置【平台作品ID】或未上传【授权书PDF】或未填写【权利人】：\n\n"
                 f"👉 {missing_str}\n\n"
                 f"请先前往【📚 作品管理】页面，补充完整后再来发起投诉！\n"
@@ -729,14 +848,11 @@ class LinksPage(QWidget):
         conn = get_conn()
         self.book_list = conn.execute("SELECT id, name, platform_id, evidence_path FROM books").fetchall()
         conn.close()
-
-        # 刷新后重新绑定，确保新书的书单也能读到
         if hasattr(self, 'table'):
             self.table.setItemDelegateForColumn(1, BookComboDelegate(self.table, self.book_list))
 
     def on_item_changed(self, item):
-        if self._is_updating:
-            return
+        if self._is_updating: return
 
         row = item.row()
         col = item.column()
@@ -750,7 +866,7 @@ class LinksPage(QWidget):
         if col == 3:
             raw_url = item.text().strip()
 
-            current_display = self.cat_group.checkedButton().text()
+            current_display = self._current_cat  # ★ 改为使用内存记录的当前分类
             auto_cat = get_platform_category(raw_url)
             sub_cats = ["百度搜索", "百度网盘", "百度知道", "百度贴吧", "夸克搜索", "夸克网盘", "uc网盘"]
 
@@ -763,11 +879,9 @@ class LinksPage(QWidget):
                         msg += f"（系统识别为【{auto_cat}】）"
 
                     reply = QMessageBox.question(
-                        self,
-                        "⚠️ 分类不匹配提示",
+                        self, "⚠️ 分类不匹配提示",
                         f"{msg}\n\n请核对链接，是否强制将其保留在当前分类下？",
-                        QMessageBox.Yes | QMessageBox.No,
-                        QMessageBox.No
+                        QMessageBox.Yes | QMessageBox.No, QMessageBox.No
                     )
 
                     if reply != QMessageBox.Yes:
@@ -785,8 +899,7 @@ class LinksPage(QWidget):
             elif current_display == "其他":
                 self._is_updating = True
                 self.model.item(row, 2).setText("其他")
-
-            else:  # 全部链接页面
+            else:
                 self._is_updating = True
                 if auto_cat and not self.model.item(row, 2).text().strip():
                     self.model.item(row, 2).setText(auto_cat)
@@ -816,8 +929,7 @@ class LinksPage(QWidget):
 
     def update_row_style(self, row):
         items = [self.model.item(row, c) for c in [1, 2, 3]]
-        if not all(items):
-            return
+        if not all(items): return
 
         texts = [it.text().replace(" (重复资源链接)", "").strip() for it in items]
         db_id = self.model.item(row, 0).data(Qt.UserRole)
@@ -909,12 +1021,12 @@ class LinksPage(QWidget):
         selected_rows = set()
         for index in self.table.selectionModel().selectedRows():
             selected_rows.add(index.row())
-        if not selected_rows:
-            return
+        if not selected_rows: return
+
         reply = QMessageBox.question(self, "确认删除", f"确定要删除选中的 {len(selected_rows)} 行记录吗？",
                                      QMessageBox.Yes | QMessageBox.No)
-        if reply != QMessageBox.Yes:
-            return
+        if reply != QMessageBox.Yes: return
+
         conn = get_conn()
         for proxy_row in sorted(list(selected_rows), reverse=True):
             proxy_idx = self.proxy_model.index(proxy_row, 0)
@@ -931,8 +1043,7 @@ class LinksPage(QWidget):
         self._is_updating = True
         self.model.removeRows(0, self.model.rowCount())
 
-        current_display = self.cat_group.checkedButton().text()
-        target_cats = self.cat_map.get(current_display, ["全部资源"])
+        target_cats = self.cat_map.get(self._current_cat, ["全部资源"])
 
         if target_cats == ["全部资源"]:
             self.report_btn.hide()
@@ -978,20 +1089,14 @@ class LinksPage(QWidget):
                 url_item.setForeground(QColor("red"))
                 url_item.setFont(QFont("Microsoft YaHei", 9, QFont.Bold))
 
-            if comp_time and str(comp_time).strip():
-                display_status = ""
-            elif res_status == "已失效":
-                display_status = "已失效"
-            else:
-                display_status = ""
+            display_status = ""
+            if not (comp_time and str(comp_time).strip()):
+                display_status = "已失效" if res_status == "已失效" else ""
 
             item_res_status = QStandardItem(display_status)
 
             self.model.appendRow([
-                chk_item,
-                item_book,
-                item_cat,
-                url_item,
+                chk_item, item_book, item_cat, url_item,
                 QStandardItem(name or ""),
                 QStandardItem(attr or ""),
                 QStandardItem(code or ""),
@@ -1011,7 +1116,17 @@ class LinksPage(QWidget):
             chk_item.setData(None, Qt.UserRole)
             self.model.appendRow([chk_item] + [QStandardItem("") for _ in range(9)])
 
-        self.proxy_model.filter_dict.clear()
+        # ★ 不再清理 filter_dict，交给 _apply_filters_to_proxy 和 _on_filter_changed 管理
+        # self.proxy_model.filter_dict.clear()
+
+        # 如果是首次加载或分类发生改变，确保 proxy 应用的是最新保存的筛选
+        if not getattr(self, '_initialized_filter', False):
+            self._apply_filters_to_proxy()
+            self._initialized_filter = True
+
         self.proxy_model.invalidateFilter()
         self.table.clearSelection()
         self._is_updating = False
+
+        # ★ 更新右上角统计条
+        self._update_stats()

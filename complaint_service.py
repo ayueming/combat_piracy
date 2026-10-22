@@ -57,7 +57,7 @@ def prepare_complaints_data(model, book_list):
                 "platform_id": p_id or "",
                 "evidence_path": evidence_path or "",
                 "rights_holder": rights_holder or "",
-                "baidu_id": baidu_id or "",  # ★ 核心修复：把百度ID塞进数据字典里
+                "baidu_id": baidu_id or "",  # ★ 核心修复：把百度CP号塞进数据字典里
                 # 这里的 cat 就是你说的“分类”（如：夸克网盘、夸克搜索）
                 "cat": model.item(row, 2).text(),
                 "url": model.item(row, 3).text().replace(" (重复资源链接)", "").strip(),

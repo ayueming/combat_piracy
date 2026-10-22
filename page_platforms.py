@@ -1,15 +1,11 @@
-import os
-import threading
-import time
-
+# page_platforms.py
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QLabel, QPushButton,
-                               QFrame, QGridLayout)
+                               QFrame, QGridLayout, QApplication)
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
-from playwright.sync_api import sync_playwright
 
-# ★ 引入路径管理
-from app_paths import DATA_DIR
+# ★ 引入统一浏览器管理器
+from browser_manager import BrowserManager
 
 
 class PlatformCard(QFrame):
@@ -19,7 +15,6 @@ class PlatformCard(QFrame):
         self.url = url
         self.setCursor(Qt.PointingHandCursor)
 
-        # 基于主色计算悬停/按下色（不带 alpha，避免 Qt 的 #AARRGGBB 坑）
         base = QColor(color)
         hover_bg = base.darker(112).name()
         pressed_bg = base.darker(130).name()
@@ -58,7 +53,7 @@ class PlatformCard(QFrame):
 
         self.btn = QPushButton("🌐 打开投诉后台")
         self.btn.setCursor(Qt.PointingHandCursor)
-        self.btn.setFocusPolicy(Qt.NoFocus)  # 防止点完留焦点虚线框
+        self.btn.setFocusPolicy(Qt.NoFocus)
 
         self.btn.setStyleSheet(f"""
             QPushButton {{
@@ -83,41 +78,13 @@ class PlatformCard(QFrame):
         layout.addWidget(self.btn)
 
     def open_browser(self):
-        def run_playwright():
-            try:
-                with sync_playwright() as p:
-                    # ★ 核心修复：根据平台名字，决定读取哪个登录态文件夹
-                    if "百度" in self.name:
-                        dir_name = "login_baidu_data"
-                    elif "夸克" in self.name:
-                        dir_name = "login_quark_data"
-                    else:
-                        # 给 UC 预留的，如果以后加了 UC 自动投诉，就用这个
-                        dir_name = "login_uc_data"
-
-                    user_data_dir = os.path.join(DATA_DIR, dir_name)
-
-                    browser = p.chromium.launch_persistent_context(
-                        user_data_dir=user_data_dir,
-                        headless=False,
-                        args=["--start-maximized"]
-                    )
-                    page = browser.pages[0]
-                    page.goto(self.url)
-                    while True:
-                        try:
-                            if len(browser.pages) == 0:
-                                break
-                        except Exception:
-                            break
-                        time.sleep(1)
-                    browser.close()
-            except Exception as e:
-                print(f"Playwright 启动失败: {e}")
-
-        t = threading.Thread(target=run_playwright)
-        t.daemon = True
-        t.start()
+        try:
+            # ★ 直接在主线程调用单例。
+            # 因为 new_page 内部设置了极速返回（15秒超时放行），所以不用担心卡界面。
+            bm = BrowserManager.instance()
+            bm.new_page(self.url)
+        except Exception as e:
+            print(f"打开浏览器失败: {e}")
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -140,7 +107,7 @@ class PlatformsPage(QWidget):
         layout.addWidget(title)
 
         tip = QLabel(
-            "点击下方任意卡片，将调用真实浏览器打开平台后台。")
+            "点击下方任意卡片，将在统一浏览器中打开平台后台（无需重新登录）。")
         tip.setStyleSheet("font-size: 14px; color: #666; margin-bottom: 20px;")
         layout.addWidget(tip)
 

@@ -1,12 +1,14 @@
+# auto_complaint_baidu.py
 import time
 import os
 import openpyxl
 from openpyxl import Workbook
-from playwright.sync_api import sync_playwright
 from PySide6.QtCore import QObject, Signal
 
-# ★ 引入路径管理
-from app_paths import DATA_DIR, get_temp_dir
+# ★ 引入路径管理和统一浏览器
+from app_paths import get_user_dir
+from db_config import get_current_user
+from browser_manager import BrowserManager
 
 
 class AutoComplaintSignals(QObject):
@@ -22,22 +24,25 @@ def run_auto_complaint_baidu(complaints_data, signals: AutoComplaintSignals = No
     if not complaints_data:
         return False
 
+    user_id = get_current_user()
+    if not user_id:
+        log("❌ 错误：未获取到当前登录用户")
+        return False
+    user_dir = get_user_dir(user_id)
+
     first_item = complaints_data[0]
     book_name = first_item.get("book", "未知作品")
 
     baidu_id = first_item.get("baidu_id", "")
-    # 清洗书名，去掉《》等符号
     clean_book_name = book_name.strip("《》")
 
-    # ================= 辅助函数：遇错冻结浏览器 =================
     def wait_for_user_handle(page, error_msg=""):
         log(f"❌ 运行中断: {error_msg}")
         log("🛑 脚本已暂停，未关闭浏览器。请在弹出的窗口中查看当前状态。")
-        log("👉 您可以手动接管完成后续操作，或者直接点击浏览器右上角的 X 关闭它，程序会自动结束。")
+        log("👉 您可以手动接管完成后续操作，或者直接点击浏览器该标签页右上角的 X 关闭它，程序会自动结束。")
 
         try:
-            # ★ 修改：截图保存到 data/error_screenshots
-            screenshot_dir = os.path.join(DATA_DIR, "error_screenshots")
+            screenshot_dir = os.path.join(user_dir, "error_screenshots")
             if not os.path.exists(screenshot_dir):
                 os.makedirs(screenshot_dir)
 
@@ -51,19 +56,17 @@ def run_auto_complaint_baidu(complaints_data, signals: AutoComplaintSignals = No
 
         while True:
             try:
-                if page.is_closed() or len(page.context.pages) == 0:
-                    log("✅ 检测到浏览器已关闭，任务结束。")
+                # ★ 改造：因为统一了浏览器，只需检查当前 page 是否被关闭
+                if page.is_closed():
+                    log("✅ 检测到当前标签页已关闭，任务结束。")
                     return False
             except:
                 return False
             time.sleep(2)
 
-    # 1. 生成百度要求的批量上传 Excel
     log("正在生成本次投诉的 Excel 文件...")
-    # ★ 修改：临时文件生成在 data/temp 目录下
-    temp_excel_path = os.path.join(get_temp_dir(), "temp_baidu_import.xlsx")
+    temp_excel_path = os.path.join(user_dir, "temp", "temp_baidu_import.xlsx")
 
-    # 尝试先删除可能残留的旧文件，防止权限冲突
     if os.path.exists(temp_excel_path):
         try:
             os.remove(temp_excel_path)
@@ -81,44 +84,24 @@ def run_auto_complaint_baidu(complaints_data, signals: AutoComplaintSignals = No
         log(f"❌ 生成 Excel 失败: {e}")
         return False
 
-    p = sync_playwright().start()
-    browser = None
     page = None
 
     try:
-        # ★ 修改：重命名为 login_baidu_data，并放在 data 目录下
-        default_dir = os.path.join(DATA_DIR, "login_baidu_data")
+        log("正在唤醒统一浏览器...")
 
-        lock_file = os.path.join(default_dir, "SingletonLock")
-        if os.path.exists(lock_file):
-            try:
-                os.remove(lock_file)
-            except:
-                pass
-
-        log("正在启动浏览器...")
+        # ★ 核心改造：使用 BrowserManager 启动/连接浏览器
         try:
-            browser = p.chromium.launch_persistent_context(
-                user_data_dir=default_dir,
-                headless=False,
-                args=["--start-maximized"]
-            )
+            bm = BrowserManager.instance()
+            page = bm.new_page()
         except Exception as launch_err:
-            err_str = str(launch_err)
-            if "Target page" in err_str or "ProcessSingleton" in err_str or "browser has been closed" in err_str:
-                log("❌ 检测到上一个百度投诉浏览器窗口未关闭！")
-                log("👉 请先关闭之前残留的浏览器窗口（必要时请在任务管理器结束 Chrome 进程），然后再重新运行本批次。")
-                return False
-            else:
-                raise launch_err
-
-        page = browser.pages[0] if len(browser.pages) > 0 else browser.new_page()
+            log(f"❌ 浏览器启动失败: {launch_err}")
+            log("👉 请检查是否有残留的 Chrome 进程，或任务管理器强制结束后重试。")
+            return False
 
         log("正在打开百度版权投诉页...")
-        page.goto("https://newcopyright.baidu.com/")
-        time.sleep(3)
+        page.goto("https://newcopyright.baidu.com/", wait_until="domcontentloaded", timeout=30000)
+        time.sleep(2)
 
-        # ================= 2. 登录状态检测与接管 =================
         log("⏳ 正在检查账号状态...")
         page.wait_for_timeout(2000)
 
@@ -148,7 +131,7 @@ def run_auto_complaint_baidu(complaints_data, signals: AutoComplaintSignals = No
                     log(f"⏳ 等待登录中...（已等待 {waited_login} 秒）")
 
                 try:
-                    page.goto("https://newcopyright.baidu.com/", timeout=10000)
+                    page.goto("https://newcopyright.baidu.com/", timeout=10000, wait_until="domcontentloaded")
                     page.wait_for_timeout(1500)
                     if page.locator("button:has-text('发起投诉'):visible").count() > 0 and \
                             page.locator("input[placeholder='手机号/用户名/邮箱']").count() == 0:
@@ -161,7 +144,6 @@ def run_auto_complaint_baidu(complaints_data, signals: AutoComplaintSignals = No
             if not logged_in:
                 return wait_for_user_handle(page, "等待登录超时（5分钟）")
 
-        # ================= 3. 点击发起投诉 -> /subject =================
         log("正在点击“发起投诉”...")
         try:
             start_btn = page.locator("button:has-text('发起投诉'):visible").first
@@ -174,7 +156,6 @@ def run_auto_complaint_baidu(complaints_data, signals: AutoComplaintSignals = No
         except Exception as e:
             return wait_for_user_handle(page, f"进入主体信息页(/subject)失败: {e}")
 
-        # ================= 4. 账号主体信息页 -> /hasownership =================
         log("正在确认账号主体信息，点击“下一步”...")
         try:
             next_btn = page.locator("button.el-button--primary:has-text('下一步'):visible").first
@@ -187,17 +168,16 @@ def run_auto_complaint_baidu(complaints_data, signals: AutoComplaintSignals = No
         except Exception as e:
             return wait_for_user_handle(page, f"进入权属登记页(/hasownership)失败: {e}")
 
-        # ================= 5. 权属登记页面 -> /complaint =================
         try:
             if baidu_id:
-                log(f"✅ 检测到百度ID，正在通过 ID 搜索: {baidu_id}")
+                log(f"✅ 检测到百度CP号，正在通过 ID 搜索: {baidu_id}")
                 id_input = page.locator("input[placeholder*='ID'], input[placeholder*='id']").first
                 if id_input.count() > 0:
                     id_input.fill(baidu_id)
                 else:
                     page.locator("input").nth(1).fill(baidu_id)
             else:
-                log(f"⚠️ 未检测到百度ID，正在通过 作品名 搜索: {clean_book_name}")
+                log(f"⚠️ 未检测到百度CP号，正在通过 作品名 搜索: {clean_book_name}")
                 name_input = page.locator("input[placeholder='请输入作品名称']").first
                 name_input.wait_for(state="visible", timeout=10000)
                 name_input.fill(clean_book_name[:4])
@@ -216,10 +196,8 @@ def run_auto_complaint_baidu(complaints_data, signals: AutoComplaintSignals = No
         except Exception as e:
             return wait_for_user_handle(page, f"选择作品失败（可能未登记或网络慢）: {e}")
 
-        # ================= 6. 填写投诉材料页面 =================
         log("正在填写投诉表单...")
 
-        # 6.1 选择投诉产品
         log("正在选择投诉产品...")
         try:
             select_input = page.locator(".el-select input[placeholder='请选择']").first
@@ -242,7 +220,6 @@ def run_auto_complaint_baidu(complaints_data, signals: AutoComplaintSignals = No
         except Exception as e:
             return wait_for_user_handle(page, f"选择投诉产品失败: {e}")
 
-        # 6.2 填写投诉描述
         log("正在填写投诉描述...")
         try:
             p_id = first_item.get("platform_id", "")
@@ -264,7 +241,6 @@ def run_auto_complaint_baidu(complaints_data, signals: AutoComplaintSignals = No
         except Exception as e:
             return wait_for_user_handle(page, f"填写描述失败: {e}")
 
-        # 6.3 填写原版链接
         log("正在填写原版链接...")
         try:
             page.locator("input[placeholder='请输入链接标题']").first.click(force=True)
@@ -276,7 +252,6 @@ def run_auto_complaint_baidu(complaints_data, signals: AutoComplaintSignals = No
         except Exception as e:
             return wait_for_user_handle(page, f"填写原版链接失败: {e}")
 
-        # 6.4 批量上传侵权链接
         log("正在自动上传批量链接 Excel...")
         try:
             with page.expect_file_chooser() as fc_info:
@@ -288,24 +263,14 @@ def run_auto_complaint_baidu(complaints_data, signals: AutoComplaintSignals = No
         except Exception as e:
             return wait_for_user_handle(page, f"自动上传文件失败: {e}")
 
-        # ★ 6.5 检测“该链接已投诉”的报错（挂起等待模式）
         if page.locator("text=该链接已投诉").count() > 0:
             log("❌ 检测到本批次有链接【已被投诉】（存在历史记录）。")
-            log("👉 存在已投诉链接，请手动删除后完成后续投诉，关闭浏览器，标记为已投诉，或者直接关闭浏览器，在系统中删除已投诉链接，再次发起投诉。")
-            log("⏳ 脚本已暂停，请手动在网页中操作。如果您想回软件处理，请直接关闭浏览器窗口，程序将自动结束。")
-
-            while True:
-                try:
-                    if page.is_closed() or len(page.context.pages) == 0:
-                        log("✅ 检测到浏览器已关闭，任务结束。")
-                        return False
-                except:
-                    return False
-                time.sleep(2)
+            log("👉 存在已投诉链接，请手动删除后完成后续投诉，关闭当前标签页，标记为已投诉，或者直接关闭标签页。")
+            log("⏳ 脚本已暂停，请手动在网页中操作。")
+            return wait_for_user_handle(page, "存在已投诉记录")
         else:
             log("✅ 链接检查通过，未发现已投诉记录。")
 
-        # ================= 7. 点击下一步 -> /verification =================
         log("正在进入下一步（身份真实性验证）...")
         try:
             next_btn_2 = page.locator("button.el-button--primary:has-text('下一步'):visible").last
@@ -318,7 +283,6 @@ def run_auto_complaint_baidu(complaints_data, signals: AutoComplaintSignals = No
         except Exception as e:
             return wait_for_user_handle(page, f"进入扫码页(/verification)失败: {e}")
 
-        # ================= 8. 等待人工扫码 -> /confirm (10分钟) =================
         log("👉 【需要人工干预】请在弹出的页面中扫码进行身份验证！")
         log("扫码成功后，脚本将自动继续并提交...")
 
@@ -328,26 +292,21 @@ def run_auto_complaint_baidu(complaints_data, signals: AutoComplaintSignals = No
 
         while waited < max_wait:
             try:
-                # 遍历当前所有标签页
-                current_pages = page.context.pages
+                # ★ 改造：由于统一了浏览器，扫码后可能会在当前标签页跳转，也可能新开一个标签页
+                # 我们获取当前浏览器里所有的标签页来找
+                current_pages = bm._context.pages
                 for p_tab in current_pages:
                     if p_tab.is_closed():
                         continue
-
-                    # 情况 1：URL 包含 confirm，准确率最高
                     if "confirm" in p_tab.url:
-                        page = p_tab  # 如果跳到了新标签页，把控制权交给新页面
+                        page = p_tab
                         scan_success = True
                         break
-
-                    # 情况 2：页面上出现了【可见的】“提交投诉”按钮
                     if p_tab.locator("button:has-text('提交投诉'):visible").count() > 0:
                         scan_success = True
                         break
-
                 if scan_success:
                     break
-
             except Exception:
                 pass
 
@@ -361,15 +320,12 @@ def run_auto_complaint_baidu(complaints_data, signals: AutoComplaintSignals = No
             return wait_for_user_handle(page, "等待扫码超时（10分钟）或发生页面异常")
 
         log("✅ 扫码成功，已进入确认页面。")
-        time.sleep(3)  # 给页面渲染和过渡动画留出 3 秒时间
+        time.sleep(3)
 
-        # ================= 9. 最终确认与提交 =================
         try:
-            # 确保页面加载完毕，滚动到底部
             page.evaluate("window.scrollTo(0, document.body.scrollHeight);")
             time.sleep(1.5)
 
-            # 勾选同意协议
             try:
                 checkbox = page.locator("span.el-checkbox__inner:visible").first
                 if checkbox.count() > 0 and checkbox.is_visible():
@@ -378,13 +334,11 @@ def run_auto_complaint_baidu(complaints_data, signals: AutoComplaintSignals = No
             except:
                 pass
 
-            # 点击提交
             submit_btn = page.locator("button:has-text('提交投诉'):visible").first
             submit_btn.wait_for(state="visible", timeout=10000)
             submit_btn.click(force=True)
             log("🎉 已点击提交！正在等待百度响应...")
 
-            # 轮询检测成功标志
             success_found = False
             for _ in range(15):
                 if "complete" in page.url:
@@ -411,17 +365,19 @@ def run_auto_complaint_baidu(complaints_data, signals: AutoComplaintSignals = No
             wait_for_user_handle(page, "发生严重的脚本运行异常")
         return False
     finally:
-        # 无论成功失败，最后一定会在 finally 里清理掉临时 Excel
         if os.path.exists(temp_excel_path):
             try:
                 os.remove(temp_excel_path)
             except:
                 pass
 
-        p.stop()
+        # ★ 改造：不再强杀浏览器进程，而是优雅地关闭当前标签页
         try:
-            if is_all and page and not page.is_closed() and browser and len(browser.pages) > 0:
+            if is_all and page and not page.is_closed():
                 time.sleep(3)
-                browser.close()
+                page.close()
+                print("（当前百度标签页已关闭，浏览器保留在后台）")
+            else:
+                print("（浏览器已保留，未自动关闭）")
         except:
             pass

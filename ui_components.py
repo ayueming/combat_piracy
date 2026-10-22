@@ -3,7 +3,7 @@ from PySide6.QtWidgets import (QHeaderView, QStyleOptionButton, QApplication,
                                QHBoxLayout, QPushButton, QListWidget, QListWidgetItem, QLabel,
                                QLineEdit)
 from PySide6.QtCore import (Qt, QSortFilterProxyModel, QPoint, QRect, QEvent,
-                            QItemSelection, QItemSelectionModel, QModelIndex)
+                            QItemSelection, QItemSelectionModel, QModelIndex, Signal)  # ★ 导入 Signal
 from PySide6.QtGui import QColor, QPainter, QPolygon, QPen, QPainterPath
 
 # ================= 统一默认样式常量（可被子页面传参覆盖） =================
@@ -73,6 +73,9 @@ def draw_checkbox(painter, rect, checked,
 
 
 class ExcelFilterProxyModel(QSortFilterProxyModel):
+    # ★ 新增：当筛选状态发生变化（用户点确定或重置）时，发射此信号
+    filterChanged = Signal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.filter_dict = {}
@@ -84,11 +87,21 @@ class ExcelFilterProxyModel(QSortFilterProxyModel):
             self.filter_dict[column] = allowed_values
         self.invalidateFilter()
 
-        if self.parent() and hasattr(self.parent(), 'horizontalHeader'):
-            self.parent().horizontalHeader().viewport().update()
+        # ★ 修复：原代码 self.parent() 是 LinksPage，没有 horizontalHeader。
+        # 改为通过 self.parent().table 去获取表头，解决表头筛选三角颜色不立即变的问题
+        if self.parent() and hasattr(self.parent(), 'table'):
+            self.parent().table.horizontalHeader().viewport().update()
+
+        self.filterChanged.emit()  # ★ 发射信号，通知页面去保存筛选状态并更新统计条
 
     def filterAcceptsRow(self, source_row, source_parent):
         model = self.sourceModel()
+
+        # ★ 新增：如果 1~9 列全为空，说明是底部用于新增的“占位空行”，永不参与筛选
+        if all(not str(model.data(model.index(source_row, c), Qt.DisplayRole) or "").strip()
+               for c in range(1, model.columnCount())):
+            return True
+
         for col, allowed in self.filter_dict.items():
             idx = model.index(source_row, col, source_parent)
             val = model.data(idx, Qt.DisplayRole)

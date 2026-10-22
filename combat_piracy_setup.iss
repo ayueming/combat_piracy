@@ -20,10 +20,11 @@ ArchitecturesInstallIn64BitMode=x64compatible
 DisableProgramGroupPage=yes
 ; 默认需要管理员权限（安装到 Program Files）
 PrivilegesRequired=admin
-; 极限压缩
-Compression=lzma2
+; ★ 优化：使用极限压缩，打包时间稍长，但安装包体积能小很多
+Compression=lzma2/ultra64
 SolidCompression=yes
-WizardStyle=modern dynamic
+; ★ 修正：WizardStyle 只接受 classic / modern，dynamic 无效
+WizardStyle=modern
 
 ; ★ 新增：指定安装包输出到项目下的 installer_output 文件夹
 OutputDir=installer_output
@@ -31,7 +32,7 @@ OutputDir=installer_output
 OutputBaseFilename=打盗维权系统_安装包_v{#MyAppVersion}
 
 [Languages]
-; ★ 新增：支持中文安装界面
+; 支持中文安装界面
 Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
 
 [Tasks]
@@ -39,8 +40,20 @@ Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.i
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: checkedonce
 
 [Files]
-; ★ 核心：打包 dist 里的所有东西
-Source: "E:\combat_piracy\dist\打盗维权系统\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+; =========================================================================
+; ★ 浏览器：从项目根目录直接装到 {app}\ms-playwright（exe 同级）
+; ★ onlyifdoesntexist：老客户升级时，已存在的浏览器文件被跳过，实现秒更新
+; =========================================================================
+Source: "E:\combat_piracy\ms-playwright\*"; DestDir: "{app}\ms-playwright"; \
+    Flags: ignoreversion recursesubdirs createallsubdirs onlyifdoesntexist
+
+; =========================================================================
+; ★ 程序文件：exe、_internal、config、md 等
+; ★ Excludes 防止 dist 里万一残留 ms-playwright 时覆盖上面装好的浏览器
+; =========================================================================
+Source: "E:\combat_piracy\dist\打盗维权系统\*"; DestDir: "{app}"; \
+    Excludes: "\ms-playwright\*"; \
+    Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 ; 开始菜单和桌面快捷方式
@@ -52,5 +65,10 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: de
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
 
 [UninstallDelete]
-; ★ 核心保护：卸载时，只删除程序的依赖，绝对不碰 data 文件夹！
-; 这里故意不写任何关于 {app}\data 的指令，Inno Setup 就只会删除它自己安装的文件，而 data 是程序后来生成的，不会被卸载器删除。
+; =========================================================================
+; ★ 核心保护：卸载时，绝对不碰用户数据！
+; 因为我们现在的架构，数据是在 C:\Users\用户名\AppData\Local\CombatPiracy 里，
+; 所以卸载软件（删除 Program Files 下的文件）根本不会影响数据。
+; 客户重新安装软件后，只要登录，原来的作品、证据都会自动恢复。
+; 这里留空即可，Inno Setup 默认只删除它安装的文件。
+; =========================================================================

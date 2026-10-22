@@ -2,7 +2,8 @@
 import os
 import json
 from datetime import datetime, timezone, timedelta
-from app_paths import DATA_DIR
+from app_paths import get_user_dir
+from db_config import get_current_user
 
 
 class LicenseManager:
@@ -18,9 +19,9 @@ class LicenseManager:
 
     def refresh_status(self):
         """重新读取本地文件，更新过期状态"""
-        auth_file = os.path.join(DATA_DIR, "auth_info.json")
+        user_id = get_current_user()
 
-        # 开发模式跳过
+        # 开发模式或未登录时跳过
         try:
             from config import is_dev_mode
             if is_dev_mode():
@@ -29,6 +30,13 @@ class LicenseManager:
                 return
         except:
             pass
+
+        if not user_id:
+            self._is_expired = True
+            self._days_left = 0
+            return
+
+        auth_file = os.path.join(get_user_dir(user_id), "auth.json")
 
         if not os.path.exists(auth_file):
             self._is_expired = True

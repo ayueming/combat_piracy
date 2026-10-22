@@ -1,4 +1,5 @@
 import os
+import sys
 import json
 from datetime import datetime, timezone, timedelta
 
@@ -6,7 +7,8 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushB
                                QMessageBox, QInputDialog, QTextBrowser, QTabWidget, QApplication)
 from PySide6.QtCore import Qt
 
-from app_paths import APP_DIR, DATA_DIR
+from app_paths import APP_DIR, get_session_path, get_user_dir
+from db_config import get_current_user
 
 
 class ProfilePage(QWidget):
@@ -184,10 +186,17 @@ class ProfilePage(QWidget):
                            padding: 20px; font-size: 14px; color: #333333; }
         """)
 
-        # ★ 智能寻址：先找根目录，找不到就去 _internal 里找（兼容 PyInstaller 6.x 打包）
-        help_path = os.path.join(APP_DIR, "help.md")
-        if not os.path.exists(help_path):
-            help_path = os.path.join(APP_DIR, "_internal", "help.md")
+        # ★ 修复寻址逻辑：优先读取外部（支持热更新），找不到再去内部（_MEIPASS 指向 _internal）
+        if getattr(sys, 'frozen', False):
+            exe_dir = os.path.dirname(sys.executable)
+        else:
+            exe_dir = os.path.dirname(os.path.abspath(__file__))
+
+        help_path = os.path.join(exe_dir, "help.md")
+
+        # 如果外部没有，去打包的临时目录里找
+        if not os.path.exists(help_path) and hasattr(sys, '_MEIPASS'):
+            help_path = os.path.join(sys._MEIPASS, "help.md")
 
         if os.path.exists(help_path):
             try:
@@ -203,10 +212,11 @@ class ProfilePage(QWidget):
     # ================= 数据刷新与事件 =================
     def refresh_profile(self):
         self._auth_info = None
-        auth_file = os.path.join(DATA_DIR, "auth_info.json")
+        user_id = get_current_user()
 
+        # 开发模式未登录时的兜底
         from config import is_dev_mode
-        if is_dev_mode() and not os.path.exists(auth_file):
+        if not user_id and is_dev_mode():
             self.lbl_nickname.setText("开发者")
             self.lbl_email.setText("本地模式")
             self.lbl_vip.setText("无限制")
@@ -218,7 +228,7 @@ class ProfilePage(QWidget):
             self.btn_logout.setVisible(False)
             return
 
-        if not os.path.exists(auth_file):
+        if not user_id:
             self.lbl_nickname.setText("未登录")
             self.lbl_email.setText("-")
             self.lbl_vip.setText("-")
@@ -228,6 +238,12 @@ class ProfilePage(QWidget):
             self.btn_rename.setEnabled(False)
             self.btn_copy_id.setEnabled(False)
             self.btn_logout.setVisible(False)
+            return
+
+        auth_file = os.path.join(get_user_dir(user_id), "auth.json")
+
+        if not os.path.exists(auth_file):
+            self.lbl_nickname.setText("数据缺失")
             return
 
         try:
@@ -272,7 +288,7 @@ class ProfilePage(QWidget):
         else:
             self.lbl_created_at.setText("未知")
 
-        # 5. 授权状况 (显示具体过期时间)
+        # 5. 授权状况
         expires_at_str = info.get("expires_at")
         if not expires_at_str:
             self.lbl_vip.setText("永久有效")
@@ -311,16 +327,18 @@ class ProfilePage(QWidget):
         reply = QMessageBox.question(self, "退出登录", "确定要退出当前账号吗？",
                                      QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if reply == QMessageBox.Yes:
-            auth_file = os.path.join(DATA_DIR, "auth_info.json")
-            if os.path.exists(auth_file):
+            # 删除自动登录的 session 指针即可，保留用户自己的 auth.json 方便下次快速登录
+            session_file = get_session_path()
+            if os.path.exists(session_file):
                 try:
-                    os.remove(auth_file)
+                    os.remove(session_file)
                 except Exception as e:
-                    QMessageBox.warning(self, "错误", f"无法清除本地登录凭证：{e}")
+                    QMessageBox.warning(self, "错误", f"无法清除自动登录状态：{e}")
                     return
 
-            QMessageBox.information(self, "已退出", "已退出登录，软件将自动关闭。请重新打开软件进行登录。")
-            QApplication.quit()
+            QMessageBox.information(self, "已退出", "已退出登录，软件将返回登录界面。")
+            # 关闭主窗口，触发 main.py 里的 while 循环重新弹出登录框
+            self.window().close()
 
     def on_rename_clicked(self):
         info = self._auth_info
@@ -375,7 +393,7 @@ class ProfilePage(QWidget):
 
             if update_resp.status_code == 200:
                 info["nickname"] = new_name
-                auth_file = os.path.join(DATA_DIR, "auth_info.json")
+                auth_file = os.path.join(get_user_dir(user_id), "auth.json")
                 with open(auth_file, "w", encoding="utf-8") as f:
                     json.dump(info, f)
 

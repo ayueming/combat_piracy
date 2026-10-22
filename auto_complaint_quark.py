@@ -1,29 +1,85 @@
+# auto_complaint_quark.py
 import time
 import re
 import os
-import openpyxl
-
-from openpyxl import Workbook #冗余行，可删可不删
-from playwright.sync_api import sync_playwright
+from openpyxl import Workbook
 from PySide6.QtCore import QObject, Signal
 
-# ★ 引入路径管理
-from app_paths import DATA_DIR, get_temp_dir
+from app_paths import get_user_dir
+from db_config import get_current_user
+from browser_manager import BrowserManager  # ★ 引入统一浏览器管理器
 
 
 class AutoComplaintSignals(QObject):
     progress = Signal(str)
 
 
-def run_auto_complaint(complaints_data, signals: AutoComplaintSignals = None, is_all=False):
+def check_and_wait_login(page, signals, stop_event, login_event, dialog_signal):
+    """
+    检测是否登录。增加页面渲染等待时间，防止刚刷新没加载出来导致误判。
+    """
+    while True:
+        if stop_event.is_set():
+            return False
+
+        # 1. 给页面留一点渲染时间，等待浏览器网络请求空闲
+        try:
+            page.wait_for_load_state("networkidle", timeout=5000)
+        except:
+            pass
+
+        # 2. 检查是否有登录弹窗（这是最明确的未登录标志）
+        is_unlogged = page.locator("div.box-quark, iframe#quarkIframe").count() > 0
+
+        if is_unlogged:
+            pass
+        else:
+            # 3. 没有登录框，尝试等待右上角的“夸克用户”出现（最多等 5 秒）
+            try:
+                page.wait_for_selector("span.user.ant-dropdown-trigger", timeout=5000)
+                user_span = page.locator("span.user.ant-dropdown-trigger").first
+                if "夸克用户" in user_span.inner_text():
+                    return True
+            except Exception:
+                pass
+
+        # 走到这里，说明确确实实未登录（或者加载失败）
+        if signals:
+            signals.progress.emit("⚠️ 检测到未登录/掉线，脚本已挂起...")
+        if dialog_signal:
+            dialog_signal.show_login_required()
+
+        # 阻塞当前线程，直到主线程调用 login_event.set() (用户点击已登录)
+        login_event.wait()
+        login_event.clear()
+
+        if dialog_signal:
+            dialog_signal.reset_progress()
+
+        try:
+            page.wait_for_timeout(2000)
+            page.reload()
+            page.wait_for_load_state("networkidle", timeout=10000)
+        except Exception:
+            if page.is_closed():
+                return False
+
+
+def run_auto_complaint(complaints_data, signals: AutoComplaintSignals = None, is_all=False,
+                       stop_event=None, login_event=None, dialog_signal=None):
     def log(msg):
         print(msg)
         if signals:
             signals.progress.emit(msg)
 
+    user_id = get_current_user()
+    if not user_id:
+        log("❌ 错误：未获取到当前登录用户")
+        return False
+    user_dir = get_user_dir(user_id)
+
     log("正在生成临时 Excel...")
-    # 临时文件生成在 data/temp 目录下
-    temp_excel_path = os.path.join(get_temp_dir(), "temp_quark_import.xlsx")
+    temp_excel_path = os.path.join(user_dir, "temp", "temp_quark_import.xlsx")
 
     try:
         wb = Workbook()
@@ -49,45 +105,44 @@ def run_auto_complaint(complaints_data, signals: AutoComplaintSignals = None, is
         log(f"❌ 生成临时 Excel 失败: {e}")
         return False
 
-    p = sync_playwright().start()
+    page = None
+
     try:
-        # ★ 修改：重命名为 login_quark_data，并放在 data 目录下
-        user_data_dir = os.path.join(DATA_DIR, "login_quark_data")
-        browser = p.chromium.launch_persistent_context(
-            user_data_dir=user_data_dir,
-            headless=False,
-            args=["--start-maximized"]
-        )
-        page = browser.pages[0]
+        log("正在唤醒统一浏览器...")
 
-        log("正在打开夸克投诉页...")
-        page.goto("https://ipp.quark.cn/#/home")
-
-        log("⏳ 请在浏览器扫码登录 (等待登录中，成功后将自动继续)...")
+        # ★ 使用无参单例，自动指向统一 browser_profile
         try:
-            page.wait_for_selector("text=发起侵权投诉", timeout=60000)
-            time.sleep(2)
-        except Exception:
-            log("⚠️ 等待登录超时（60秒），尝试强行继续执行...")
+            bm = BrowserManager.instance()
+            page = bm.new_page()
+        except Exception as launch_err:
+            log(f"❌ 浏览器启动失败: {launch_err}")
+            log("👉 请检查是否有残留的 Chrome 进程，或任务管理器强制结束后重试。")
+            return False
 
-        page.mouse.wheel(0, 3000)
-        time.sleep(1)
+        log("正在打开夸克投诉主页...")
+        page.goto("https://ipp.quark.cn/#/home", wait_until="domcontentloaded", timeout=30000)
+
+        # ★ 核心：前置登录检测
+        if not check_and_wait_login(page, signals, stop_event, login_event, dialog_signal):
+            log("用户中断了脚本或页面被关闭。")
+            return False
+
+        # ★ 随时检查强退
+        if stop_event.is_set(): return False
+
+        log("正在进入投诉表单...")
         try:
-            button = page.get_by_text("发起侵权投诉", exact=True)
-            if button.count() > 0:
-                button.first.scroll_into_view_if_needed()
-                time.sleep(0.5)
-                button.first.click(timeout=5000)
-            else:
-                page.locator("text=发起侵权投诉").click(timeout=5000)
-            page.wait_for_selector("text=您的身份", timeout=10000)
-            time.sleep(2)
-        except:
-            pass
+            btn_start = page.locator("button.ant-btn-primary:has-text('发起侵权投诉')").first
+            btn_start.wait_for(state="visible", timeout=10000)
+            btn_start.click()
+            page.wait_for_timeout(2000)
+        except Exception as e:
+            log(f"❌ 找不到【发起侵权投诉】按钮: {e}")
+            return False
 
         log("正在自动勾选固定选项...")
         try:
-            page.locator("label").filter(has_text="权利人").click(timeout=3000)
+            page.locator("label:has-text('权利人')").click(timeout=3000)
         except:
             pass
 
@@ -98,26 +153,18 @@ def run_auto_complaint(complaints_data, signals: AutoComplaintSignals = None, is
                 dropdown = page.locator("#obligee_id")
                 if dropdown.count() > 0:
                     dropdown.scroll_into_view_if_needed()
-                    time.sleep(0.5)
+                    page.wait_for_timeout(500)
                     dropdown.click(force=True)
-                    dropdown.dispatch_event("mousedown")
-                    dropdown.dispatch_event("mouseup")
-                    time.sleep(1.5)
+                    page.wait_for_timeout(1500)
 
                     option = page.locator(".ant-select-dropdown-menu-item").filter(has_text=first_holder).first
                     if option.count() > 0 and option.is_visible():
                         option.click(force=True)
                     else:
                         page.keyboard.press("ArrowDown")
-                        time.sleep(0.5)
+                        page.wait_for_timeout(500)
                         page.keyboard.press("Enter")
-                else:
-                    page.locator("text=请选择具体权利人").first.click(force=True)
-                    time.sleep(1)
-                    option = page.locator(".ant-select-dropdown-menu-item").filter(has_text=first_holder).first
-                    if option.count() > 0:
-                        option.click(force=True)
-                time.sleep(1)
+                page.wait_for_timeout(1000)
             except Exception as e:
                 log(f"⚠️ 自动选择权利人失败: {e}")
 
@@ -140,29 +187,32 @@ def run_auto_complaint(complaints_data, signals: AutoComplaintSignals = None, is
         except:
             pass
 
+        if stop_event.is_set(): return False
+
         log("正在执行【批量导入】...")
         try:
-            page.locator("text=批量导入").first.click()
-            time.sleep(2)
+            page.locator("a.multi-add").first.click()
+            page.wait_for_timeout(2000)
 
             with page.expect_file_chooser() as fc_info:
-                page.locator("text=上传文件").first.click()
+                btn_upload = page.locator("button.ant-btn-sm:has-text('上传文件'), button:has-text('上传文件')").first
+                btn_upload.click()
 
             file_chooser = fc_info.value
             file_chooser.set_files(os.path.abspath(temp_excel_path))
-            time.sleep(4)
+            page.wait_for_timeout(4000)
 
             log("正在点击【解析数据】...")
-            parse_btn = page.get_by_role("button", name="解析数据")
-            if parse_btn.count() == 0:
-                parse_btn = page.locator("div, span").filter(has_text="解析数据").last
-
+            parse_btn = page.locator("button.ant-btn-primary:has-text('解析数据')").first
             parse_btn.wait_for(state="visible", timeout=5000)
             parse_btn.click(force=True)
             log("✅ 解析数据点击成功！正在等待填充...")
-            time.sleep(5)
+            page.wait_for_timeout(5000)
         except Exception as e:
             log(f"❌ 解析过程出错: {e}")
+            return False
+
+        if stop_event.is_set(): return False
 
         log("正在填写投诉描述...")
         try:
@@ -185,85 +235,76 @@ def run_auto_complaint(complaints_data, signals: AutoComplaintSignals = None, is
             desc_textarea = page.locator("textarea[placeholder*='请客观公正描述']")
             if desc_textarea.count() > 0:
                 desc_textarea.fill(desc_text)
-                time.sleep(0.5)
+                page.wait_for_timeout(500)
         except Exception as e:
             log(f"填写描述失败: {e}")
 
+        # ==================== 证明材料上传 ====================
         pdf_path = complaints_data[0].get("evidence_path", "")
-        log("正在上传证明材料 PDF...")
-        try:
-            if pdf_path and os.path.exists(pdf_path):
-                file_input_pdf = page.locator("input[type='file'][accept*='.pdf']").first
-                if file_input_pdf.count() > 0:
-                    file_input_pdf.set_input_files(pdf_path)
-                    time.sleep(3)
-        except Exception as e:
-            log(f"PDF上传失败: {e}")
+        log(f"正在准备上传证明材料，路径: {pdf_path}")
 
-        log("正在滚动到底部...")
+        if pdf_path and os.path.exists(pdf_path):
+            try:
+                upload_btn = page.locator("p", has_text="点击上传").first
+                if upload_btn.count() > 0:
+                    log("找到【证明文件】上传框，正在模拟点击并注入文件...")
+                    with page.expect_file_chooser(timeout=5000) as fc_info:
+                        upload_btn.click(force=True)
+                    file_chooser = fc_info.value
+                    file_chooser.set_files(os.path.abspath(pdf_path))
+
+                    try:
+                        page.wait_for_selector("div.ant-message:has-text('上传成功')", timeout=10000)
+                        log("🎉 检测到“上传成功” Toast 提示，文件已挂载！")
+                        page.wait_for_selector("div.ant-message:has-text('上传成功')", state="hidden", timeout=5000)
+                    except Exception:
+                        log("⚠️ 未检测到“上传成功”提示，但文件可能已塞入，继续尝试提交...")
+                else:
+                    log("⚠️ 未找到“点击上传”按钮！")
+            except Exception as e:
+                log(f"❌ PDF上传过程发生异常: {e}")
+        else:
+            log(f"⚠️ 本地证明材料文件不存在或为空，跳过上传。")
+        # =====================================================
+
+        if stop_event.is_set(): return False
+
+        log("正在滚动到底部准备提交...")
         page.evaluate("window.scrollTo(0, document.body.scrollHeight);")
-        time.sleep(2)
+        page.wait_for_timeout(2000)
 
-        log("正在勾选同意协议...")
-        try:
-            checkboxes = page.locator("input.ant-checkbox-input")
-            for i in range(checkboxes.count()):
-                cb = checkboxes.nth(i)
-                if cb.is_visible() and not cb.is_checked():
-                    cb.check(force=True)
-                    time.sleep(0.5)
-        except Exception as e:
-            log(f"⚠️ 勾选协议失败: {e}")
-
-        # ================= 核心修改部分开始 =================
-        log("准备点击提交按钮...")
+        log("准备点击【提交】...")
         submit_ok = False
         try:
-            btn = page.locator(".ant-tabs-tabpane-active button.ant-btn-primary").filter(has_text="提交").first
+            btn_submit = page.locator("button.ant-btn-primary").filter(has_text=re.compile(r"提\s*交")).last
+            btn_submit.scroll_into_view_if_needed()
+            page.wait_for_timeout(1000)
 
-            if btn.count() > 0:
-                btn.scroll_into_view_if_needed()
-                time.sleep(1)
-                btn.evaluate("node => node.click()")
-                log("✅ 已通过 JS 触发提交点击！")
-            else:
-                log("⚠️ 未找到激活页面中的提交按钮，尝试点击页面最后一个可见主按钮...")
-                page.locator("button.ant-btn-primary:visible").last.click(force=True)
+            log("正在执行真实鼠标点击...")
+            btn_submit.click(force=True)
 
-            time.sleep(2)
+            log("✅ 已触发提交，等待响应...")
+            page.wait_for_timeout(2000)
 
-            # 处理二次确认弹窗（有些情况不需要，以防万一保留）
             try:
                 confirm_btn = page.locator("button.ant-btn-primary:visible").filter(
                     has_text=re.compile("确定|确认")).first
                 if confirm_btn.count() > 0 and confirm_btn.is_visible():
-                    confirm_btn.evaluate("node => node.click()")
+                    confirm_btn.click(force=True)
                     log("✅ 已点击二次确认弹窗！")
-                    time.sleep(2)
+                    page.wait_for_timeout(2000)
             except:
                 pass
 
-            # 核心：通过截图中的 UI 弹窗判断成功
             log("正在等待提交成功的弹窗响应...")
-            # ★ 修复：直接用 text=提交成功 就能匹配到包含该字样的弹窗了
             page.wait_for_selector("text=提交成功", timeout=15000)
             log("🎉 检测到「提交成功」弹窗，本批次投诉确认成功！")
             submit_ok = True
 
-            # 顺手把弹窗关掉或者点掉
-            if is_all:
-                try:
-                    page.get_by_role("button", name="投诉列表").click(timeout=3000)
-                    time.sleep(1)
-                except:
-                    pass
-
         except Exception as e:
             log(f"❌ 提交失败或未检测到成功提示: {e}")
-            # 兜底：如果失败了，截个图保存在本地，方便你查明原因
             try:
-                # ★ 修改：失败截图也放到 data/error_screenshots 里
-                error_screenshot_dir = os.path.join(DATA_DIR, "error_screenshots")
+                error_screenshot_dir = os.path.join(user_dir, "error_screenshots")
                 os.makedirs(error_screenshot_dir, exist_ok=True)
                 ts = time.strftime("%Y%m%d_%H%M%S")
                 screenshot_path = os.path.join(error_screenshot_dir, f"fail_{ts}.png")
@@ -274,33 +315,33 @@ def run_auto_complaint(complaints_data, signals: AutoComplaintSignals = None, is
 
         if not submit_ok:
             return False
-        # ================= 核心修改部分结束 =================
 
-        # 根据是否全批模式来分流
+        # ★ 核心：成功后处理
         if is_all:
-            log("✅ 提交完成！检测到全批模式，正在自动关闭当前窗口去处理下一批...")
-            time.sleep(2)  # 稍微等一等，让网络请求发出去
-            browser.close()
+            log("✅ 提交完成！正在刷新页面回到首页，准备处理下一批...")
+            page.wait_for_timeout(2000)
+            page.goto("https://ipp.quark.cn/#/home", wait_until="domcontentloaded")
             return True
         else:
-            log("👉 单次投诉模式，请确认结果后【手动关闭浏览器窗口】。")
-            while True:
-                try:
-                    if page.is_closed():
-                        log("检测到浏览器已关闭，本批次处理结束。")
-                        return True
-                except:
-                    return True
-                time.sleep(1)
+            log("👉 单次投诉模式，请确认结果。")
+            return True
 
     except Exception as e:
         log(f"❌ 运行遇到问题：{e}")
         return False
     finally:
-        # 清理临时 Excel
         if os.path.exists(temp_excel_path):
             try:
                 os.remove(temp_excel_path)
             except:
                 pass
-        p.stop()
+
+        # ★ 只关闭当前标签页，不关浏览器
+        try:
+            if is_all and not stop_event.is_set() and page and not page.is_closed():
+                page.close()
+                print("（当前标签页已关闭，浏览器保留在后台）")
+            else:
+                print("（浏览器已保留，未自动关闭）")
+        except:
+            pass

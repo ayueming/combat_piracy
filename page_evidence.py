@@ -7,10 +7,10 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushB
                                QGroupBox, QScrollArea, QFrame, QSizePolicy, QTabWidget)
 from PySide6.QtCore import Qt, QUrl
 from PySide6.QtGui import QDesktopServices, QPixmap, QImageReader
-from db_config import get_conn
+from db_config import get_conn, get_current_user
 
 # ★ 引入路径管理
-from app_paths import DATA_DIR
+from app_paths import get_user_dir
 # ★ 引入权限管理器
 from license_manager import license_mgr
 
@@ -35,7 +35,13 @@ ALLOWED_IMAGE_EXTS = ('.png', '.jpg', '.jpeg', '.bmp')
 
 
 def get_data_dir():
-    data_dir = os.path.join(DATA_DIR, "evidences_data")
+    """获取当前用户的专属证据文件夹"""
+    user_id = get_current_user()
+    if user_id:
+        data_dir = os.path.join(get_user_dir(user_id), "evidences")
+    else:
+        # 开发模式未登录时的兜底目录
+        data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "evidences_data")
     os.makedirs(data_dir, exist_ok=True)
     return data_dir
 
@@ -77,8 +83,8 @@ class EvidenceWidget(QFrame):
             QFrame { background-color: #FFFFFF; border: 1px solid #E9ECEF; border-radius: 6px; }
             QFrame:hover { border: 1px solid #D0D0D0; }
         """)
-        # 稍微加高了一点，为了放下 3 个按钮
-        self.setFixedSize(320, 310)
+        # ★ 高度从 310 调整为 360，容纳两行按钮
+        self.setFixedSize(320, 360)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(15, 15, 15, 15)
@@ -105,14 +111,32 @@ class EvidenceWidget(QFrame):
         self.lbl_file.setStyleSheet("color: #666; font-size: 11px; border: none;")
         layout.addWidget(self.lbl_file)
 
-        btn_layout = QHBoxLayout()
-        btn_layout.setSpacing(6)
-
-        # 1. 上传/更新
+        # ★ 第一行：上传/更新（主操作，独占一行）
         self.btn_upload = QPushButton("上传/更新")
         self.btn_upload.setCursor(Qt.PointingHandCursor)
         self.btn_upload.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.btn_upload.clicked.connect(self.upload_file)
+
+        # ★ UI 权限控制：过期禁用上传
+        if license_mgr.is_expired:
+            self.btn_upload.setEnabled(False)
+            self.btn_upload.setStyleSheet("""
+                QPushButton { background-color: #E5E7EB; color: #9CA3AF; border: none; border-radius: 4px;
+                              padding: 6px 0px; font-size: 12px; font-weight: bold; }
+            """)
+            self.btn_upload.setToolTip("会员已过期，无法上传或更新资料。请联系管理员续费。")
+        else:
+            self.btn_upload.setStyleSheet("""
+                QPushButton { background-color: #10B981; color: white; border: none; border-radius: 4px;
+                              padding: 6px 0px; font-size: 12px; font-weight: bold; }
+                QPushButton:hover { background-color: #059669; }
+                QPushButton:pressed { background-color: #047857; }
+            """)
+        layout.addWidget(self.btn_upload)
+
+        # ★ 第二行：下载 / 查看 / 删除
+        btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(6)
 
         # 2. 下载
         self.btn_download = QPushButton("下载")
@@ -140,25 +164,23 @@ class EvidenceWidget(QFrame):
         """)
         self.btn_view.clicked.connect(self.view_file)
 
-        # ★ UI 权限控制：过期禁用上传
-        if license_mgr.is_expired:
-            self.btn_upload.setEnabled(False)
-            self.btn_upload.setStyleSheet("""
-                QPushButton { background-color: #E5E7EB; color: #9CA3AF; border: none; border-radius: 4px;
-                              padding: 6px 0px; font-size: 12px; font-weight: bold; }
-            """)
-            self.btn_upload.setToolTip("会员已过期，无法上传或更新资料。请联系管理员续费。")
-        else:
-            self.btn_upload.setStyleSheet("""
-                QPushButton { background-color: #10B981; color: white; border: none; border-radius: 4px;
-                              padding: 6px 0px; font-size: 12px; font-weight: bold; }
-                QPushButton:hover { background-color: #059669; }
-                QPushButton:pressed { background-color: #047857; }
-            """)
+        # 4. 删除（新增）
+        self.btn_delete = QPushButton("删除")
+        self.btn_delete.setCursor(Qt.PointingHandCursor)
+        self.btn_delete.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.btn_delete.setStyleSheet("""
+            QPushButton { background-color: #EF4444; color: white; border: none; border-radius: 4px;
+                          padding: 6px 0px; font-size: 12px; font-weight: bold; }
+            QPushButton:hover { background-color: #DC2626; }
+            QPushButton:pressed { background-color: #B91C1C; }
+            QPushButton:disabled { background-color: #E5E7EB; color: #9CA3AF; }
+        """)
+        self.btn_delete.setToolTip("删除当前资料（同时删除本地文件）")
+        self.btn_delete.clicked.connect(self.delete_file)
 
-        btn_layout.addWidget(self.btn_upload, 1)
         btn_layout.addWidget(self.btn_download, 1)
         btn_layout.addWidget(self.btn_view, 1)
+        btn_layout.addWidget(self.btn_delete, 1)
         layout.addLayout(btn_layout)
 
         self.update_ui()
@@ -202,8 +224,10 @@ class EvidenceWidget(QFrame):
             self.img_label.setStyleSheet(
                 "background-color: #FAFAFA; color: #999; border: 1px dashed #DCDCDC; border-radius: 4px;")
 
+        # ★ 删除按钮：只要数据库里有记录（file_path 非空）就允许清理，即使物理文件已丢失
+        self.btn_delete.setEnabled(bool(self.file_path))
+
     def upload_file(self):
-        # ★ 逻辑层拦截
         if license_mgr.is_expired:
             QMessageBox.warning(self, "功能受限", "您的授权已过期，无法上传新的证明材料。")
             return
@@ -300,6 +324,57 @@ class EvidenceWidget(QFrame):
     def view_file(self):
         if self.file_path and os.path.exists(self.file_path):
             QDesktopServices.openUrl(QUrl.fromLocalFile(self.file_path))
+
+    # ★ 新增：删除当前证据
+    def delete_file(self):
+        type_name = EVIDENCE_TYPES.get(self.ev_type, "该资料")
+        reply = QMessageBox.question(
+            self, "确认删除",
+            f"确定要删除【{type_name}】吗？\n\n"
+            f"此操作不可恢复。\n是否继续？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+
+        file_to_delete = self.file_path
+        data_dir = get_data_dir()
+
+        # 1) 删除数据库记录
+        try:
+            conn = get_conn()
+            conn.execute(
+                "DELETE FROM evidences WHERE owner_type=? AND owner_key=? AND ev_type=?",
+                (self.owner_type, self.owner_key, self.ev_type))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            QMessageBox.critical(self, "删除失败", f"删除数据库记录失败：\n{e}")
+            return
+
+        # 2) 删除物理文件（仅限数据目录内，且没有其它记录引用）
+        if file_to_delete and os.path.exists(file_to_delete):
+            try:
+                old_abs = os.path.abspath(file_to_delete)
+                data_abs = os.path.abspath(data_dir)
+                if old_abs.startswith(data_abs):
+                    conn2 = get_conn()
+                    try:
+                        shared = conn2.execute(
+                            "SELECT 1 FROM evidences WHERE file_path=? "
+                            "UNION SELECT 1 FROM books WHERE evidence_path=? LIMIT 1",
+                            (file_to_delete, file_to_delete)
+                        ).fetchone()
+                    finally:
+                        conn2.close()
+                    if not shared:
+                        os.remove(file_to_delete)
+            except Exception as e:
+                print(f"删除物理文件失败：{e}")
+
+        # 3) 刷新界面
+        self.file_path = ""
+        self.update_ui()
+        self.parent_page.refresh_current()
 
 
 # ================= Tab 1: 权利人材料 =================
@@ -451,7 +526,7 @@ class BookTab(QWidget):
         top_layout.addWidget(self.book_combo)
         top_layout.addStretch()
 
-        self.view_weiquan_btn = QPushButton("预览维权书")
+        self.view_weiquan_btn = QPushButton("预览已上传维权书")
         self.view_weiquan_btn.setStyleSheet(
             "QPushButton { background-color: #10B981; color: white; padding: 6px 16px; "
             "border-radius: 4px; font-weight: bold; border: none; } "
@@ -459,7 +534,7 @@ class BookTab(QWidget):
         self.view_weiquan_btn.clicked.connect(self.open_weiquan_pdf)
         top_layout.addWidget(self.view_weiquan_btn)
 
-        self.export_pdf_btn = QPushButton("保存为维权书")
+        self.export_pdf_btn = QPushButton("自动生成维权书上传本系统")
         self.export_pdf_btn.clicked.connect(self.save_to_weiquan_pdf)
 
         self.export_docx_btn = QPushButton("导出维权书Word")
@@ -608,7 +683,6 @@ class BookTab(QWidget):
             QMessageBox.warning(self, "提示", "该作品还未上传维权书。")
 
     def export_word(self):
-        # ★ 逻辑层拦截
         if license_mgr.is_expired:
             QMessageBox.warning(self, "功能受限", "您的授权已过期，无法导出 Word 维权书。请联系管理员续费。")
             return
@@ -691,7 +765,6 @@ class BookTab(QWidget):
             QMessageBox.critical(self, "失败", f"导入失败：{e}")
 
     def save_to_weiquan_pdf(self):
-        # ★ 逻辑层拦截
         if license_mgr.is_expired:
             QMessageBox.warning(self, "功能受限", "您的授权已过期，无法生成 PDF 维权书。请联系管理员续费。")
             return

@@ -6,7 +6,8 @@ _secrets.py
 # ---------- 你的用户数据（隐私） ----------
 data/
 evidences_data/
-NOTE_LOCAL.txt
+0NOTE_LOCAL.txt
+changelog.txt
 
 # ---------- 体积大 / 可再生成 ----------
 ms-playwright/
@@ -29,3 +30,9 @@ venv/
 .idea/
 Thumbs.db
 .DS_Store
+/0NOTE_LOCAL.txt
+/test__browser.py
+/test_page_search.py
+/test_search.py
+/test_spiser.py
+/installer_output/

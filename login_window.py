@@ -2,27 +2,31 @@
 import os
 import re
 import json
+import time
 import httpx
 
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QLabel, QLineEdit,
     QPushButton, QApplication, QCheckBox, QMessageBox
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QRect
 from PySide6.QtGui import QFont, QCursor, QAction, QPixmap, QPainter, QPen, QIcon, QColor
-from app_paths import DATA_DIR
 
-# ★ 引入重命名后的设备指纹模块和配置
+# ★ 引入设备指纹模块和配置
 from login_device_id import get_machine_id
 from config import SUPABASE_URL, SUPABASE_ANON_KEY, has_supabase_config
 
+# ★ 引入 ui_components 中的绘制工具和常量
+from ui_components import draw_checkbox, CHECK_BOX_SIZE
 
-def _auth_cache_path():
-    return os.path.join(DATA_DIR, "auth_info.json")
+# ★ 引入新的路径管理工具
+from app_paths import get_user_dir, get_session_path
+
+EMAIL_PATTERN = r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$'
 
 
-# ★ 使用纯代码绘制“眼睛”图标
 def create_eye_icon(is_open=True):
+    """纯代码绘制“眼睛”图标"""
     pixmap = QPixmap(24, 24)
     pixmap.fill(Qt.transparent)
     painter = QPainter(pixmap)
@@ -44,6 +48,33 @@ def create_eye_icon(is_open=True):
     return QIcon(pixmap)
 
 
+class UnifiedCheckBox(QCheckBox):
+    """直接复用 ui_components 中的 draw_checkbox 来绘制，确保全软件 UI 统一"""
+
+    def __init__(self, text, parent=None):
+        super().__init__(text, parent)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFixedHeight(24)  # 固定高度避免布局拉伸
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+
+        # 计算方框位置 (左侧对齐，垂直居中)
+        box_rect = QRect(0, (self.height() - CHECK_BOX_SIZE) // 2, CHECK_BOX_SIZE, CHECK_BOX_SIZE)
+
+        # ★ 直接调用 ui_components 中的 draw_checkbox 函数
+        draw_checkbox(p, box_rect, self.isChecked())
+
+        # 绘制右侧文字
+        text_rect = QRect(box_rect.right() + 8, 0, self.width() - box_rect.width() - 8, self.height())
+        p.setPen(QColor("#666666"))
+        font = p.font()
+        font.setPixelSize(13)
+        p.setFont(font)
+        p.drawText(text_rect, Qt.AlignVCenter | Qt.AlignLeft, self.text())
+
+
 class LoginWindow(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -51,7 +82,10 @@ class LoginWindow(QDialog):
         self.setFixedSize(420, 500)
         self.is_register_mode = False
 
-        # ★ 增加非法输入时的浅红色底纹样式 QLineEdit[error="true"]
+        # 探测限频字段：60 秒内最多调 5 次 email_exists
+        self._probe_window_start = 0.0
+        self._probe_count = 0
+
         self.setStyleSheet("""
             QDialog { background-color: #FFFFFF; }
             QLabel { color: #333; }
@@ -72,17 +106,6 @@ class LoginWindow(QDialog):
             QPushButton#mainBtn:disabled { background: #9CA3AF; }
             QLabel#linkLbl { color: #10B981; font-size: 12px; }
             QLabel#linkLbl:hover { text-decoration: underline; }
-
-            QCheckBox::indicator {
-                width: 16px; height: 16px;
-                border: 1px solid #DCDCDC; border-radius: 3px;
-                background-color: white;
-            }
-            QCheckBox::indicator:checked {
-                background-color: #10B981; 
-                border: 1px solid #10B981;
-                image: url(data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxMiIgaGVpZ2h0PSIxMiIgdmlld0JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9IiNmZmZmZmYiIHN0cm9rZS13aWR0aD0iNCIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIiBzdHJva2UtbGluZWpvaW49InJvdW5kIj48cG9seWxpbmUgcG9pbnRzPSIyMCA2IDkgMTcgNCAxMiI+PC9wb2x5bGluZT48L3N2Zz4=);
-            }
         """)
         self._setup_ui()
 
@@ -105,16 +128,14 @@ class LoginWindow(QDialog):
         layout.addWidget(self.subtitle)
         layout.addSpacing(10)
 
-        # ★ 邮箱输入框
+        # 邮箱输入框
         self.email_input = QLineEdit()
         self.email_input.setPlaceholderText("邮箱")
-        # 输入时清除错误状态和底部提示
         self.email_input.textChanged.connect(lambda: self._clear_error(self.email_input))
-        # 失去焦点或回车时自动校验
         self.email_input.editingFinished.connect(self._check_email_on_focus_out)
         layout.addWidget(self.email_input)
 
-        # ★ 密码输入框
+        # 密码输入框
         self.pwd_input = QLineEdit()
         self.pwd_input.setPlaceholderText("密码（至少6位）")
         self.pwd_input.setEchoMode(QLineEdit.Password)
@@ -133,15 +154,17 @@ class LoginWindow(QDialog):
         self.reg_tip_label.hide()
         layout.addWidget(self.reg_tip_label)
 
-        self.remember_cb = QCheckBox("记住登录状态")
+        self.remember_cb = UnifiedCheckBox("记住登录状态")
         self.remember_cb.setChecked(True)
-        self.remember_cb.setStyleSheet("color: #666; font-size: 12px;")
         layout.addWidget(self.remember_cb)
 
         self.tip_label = QLabel("")
         self.tip_label.setStyleSheet("color: #E74C3C; font-size: 12px;")
         self.tip_label.setWordWrap(True)
         self.tip_label.setMinimumHeight(32)
+        self.tip_label.setTextFormat(Qt.RichText)
+        self.tip_label.setOpenExternalLinks(False)
+        self.tip_label.linkActivated.connect(self._on_tip_link)
         layout.addWidget(self.tip_label)
 
         self.main_btn = QPushButton("登 录")
@@ -150,7 +173,7 @@ class LoginWindow(QDialog):
         self.main_btn.clicked.connect(self.on_main_action)
         layout.addWidget(self.main_btn)
 
-        self.switch_lbl = QLabel("还没有账号？点击免费注册试用")
+        self.switch_lbl = QLabel("还没有账号？点击免费注册")
         self.switch_lbl.setObjectName("linkLbl")
         self.switch_lbl.setAlignment(Qt.AlignCenter)
         self.switch_lbl.setCursor(QCursor(Qt.PointingHandCursor))
@@ -158,41 +181,36 @@ class LoginWindow(QDialog):
         layout.addWidget(self.switch_lbl)
         layout.addStretch()
 
-    # ================= ★ 辅助方法：控制浅红底纹与提示 =================
+    # ================= 辅助方法：错误提示 =================
 
     def _set_input_error(self, widget, is_error):
-        """设置输入框是否为错误状态（浅红底纹）"""
         widget.setProperty("error", "true" if is_error else "false")
-        # 强制刷新样式
         widget.style().unpolish(widget)
         widget.style().polish(widget)
 
     def _clear_error(self, widget):
-        """用户重新输入时清除错误状态"""
         self._set_input_error(widget, False)
+        self.tip_label.setStyleSheet("color: #E74C3C; font-size: 12px;")
         self.tip_label.setText("")
+        self.tip_label.setMinimumHeight(32)
 
     def _check_email_on_focus_out(self):
-        """失去焦点时检查邮箱格式（仅在输入不为空时校验）"""
         email = self.email_input.text().strip()
         if not email:
             return
-        email_pattern = r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$'
-        if not re.match(email_pattern, email):
+        if not re.match(EMAIL_PATTERN, email):
             self._set_input_error(self.email_input, True)
             self._show_error("邮箱格式不正确，请检查。")
         else:
             self._set_input_error(self.email_input, False)
 
     def _check_pwd_on_focus_out(self):
-        """失去焦点时检查密码（仅在输入不为空时校验）"""
         pwd = self.pwd_input.text()
         if not pwd:
             return
 
         has_error = False
         error_msg = ""
-
         if len(pwd) < 6:
             has_error = True
             error_msg = "密码长度至少为 6 位"
@@ -206,7 +224,21 @@ class LoginWindow(QDialog):
         else:
             self._set_input_error(self.pwd_input, False)
 
-    # ================= 核心逻辑 =================
+    # ================= 提示链接分发 =================
+
+    def _on_tip_link(self, href: str):
+        if href == "register":
+            if not self.is_register_mode:
+                self.toggle_mode(None)
+            self.tip_label.setMinimumHeight(32)
+        elif href == "reset":
+            QMessageBox.information(self, "重置密码",
+                                    "请联系管理员重置密码。\n\n管理员可在后台为您设置新密码。")
+        elif href == "resend_verify":
+            QMessageBox.information(self, "邮箱验证",
+                                    "请联系管理员重新发送验证邮件，或检查垃圾邮件箱。")
+
+    # ================= 模式切换 =================
 
     def _toggle_pwd_visibility(self):
         if self.pwd_input.echoMode() == QLineEdit.Password:
@@ -219,8 +251,8 @@ class LoginWindow(QDialog):
     def toggle_mode(self, event):
         self.is_register_mode = not self.is_register_mode
 
-        # 清空所有提示和错误状态
         self.tip_label.setText("")
+        self.tip_label.setMinimumHeight(32)
         self._set_input_error(self.email_input, False)
         self._set_input_error(self.pwd_input, False)
 
@@ -243,14 +275,17 @@ class LoginWindow(QDialog):
             self.reg_tip_label.hide()
             self.switch_lbl.setText("还没有账号？点击免费注册试用")
 
+    # ================= 主入口 =================
+
     def on_main_action(self):
         email = self.email_input.text().strip()
         pwd = self.pwd_input.text()
 
-        # 提交前，先重置所有错误状态
         self._set_input_error(self.email_input, False)
         self._set_input_error(self.pwd_input, False)
+        self.tip_label.setStyleSheet("color: #E74C3C; font-size: 12px;")
         self.tip_label.setText("")
+        self.tip_label.setMinimumHeight(32)
 
         if not email:
             self._set_input_error(self.email_input, True)
@@ -261,19 +296,15 @@ class LoginWindow(QDialog):
             self._show_error("请输入密码")
             return
 
-        # ★ 注册模式下的格式校验
         if self.is_register_mode:
-            email_pattern = r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$'
-            if not re.match(email_pattern, email):
+            if not re.match(EMAIL_PATTERN, email):
                 self._set_input_error(self.email_input, True)
                 self._show_error("请输入正确的邮箱格式（如：name@example.com）")
                 return
-
             if len(pwd) < 6:
                 self._set_input_error(self.pwd_input, True)
                 self._show_error("密码长度至少为 6 位")
                 return
-
             if re.search(r'[\u4e00-\u9fa5]', pwd):
                 self._set_input_error(self.pwd_input, True)
                 self._show_error("密码不能包含中文字符")
@@ -294,6 +325,8 @@ class LoginWindow(QDialog):
         finally:
             self._set_loading(False)
 
+    # ================= 注册 =================
+
     def _do_register(self, base_url, email, pwd):
         url = f"{base_url}/auth/v1/signup"
         headers = {"apikey": SUPABASE_ANON_KEY, "Content-Type": "application/json"}
@@ -306,13 +339,21 @@ class LoginWindow(QDialog):
             return
 
         if resp.status_code != 200:
-            err_data = resp.json()
-            err_msg = err_data.get("msg", "") or err_data.get("error_description", "")
+            try:
+                err_data = resp.json()
+            except Exception:
+                err_data = {}
+            err_msg = (err_data.get("msg")
+                       or err_data.get("error_description")
+                       or err_data.get("message")
+                       or f"HTTP {resp.status_code}")
             self._show_error(f"注册失败：{err_msg}")
             return
 
         QMessageBox.information(self, "注册成功", "账号注册成功，请直接登录。")
         self.toggle_mode(None)
+
+    # ================= 登录 =================
 
     def _do_login(self, base_url, email, pwd):
         auth_url = f"{base_url}/auth/v1/token?grant_type=password"
@@ -325,17 +366,78 @@ class LoginWindow(QDialog):
             self._show_error(f"网络连接失败：{e}")
             return
 
+        # ---------- 失败分支：区分未注册 / 密码错 / 未验证 ----------
         if resp.status_code != 200:
-            err_data = resp.json()
-            err_msg = err_data.get("error_description", "") or err_data.get("msg", "")
-            if "Invalid login credentials" in err_msg:
-                self._show_error("邮箱或密码错误")
-                self._set_input_error(self.pwd_input, True)  # 登录失败密码框变红
-            else:
-                self._show_error(f"登录失败：{err_msg}")
+            try:
+                err_data = resp.json()
+            except Exception:
+                err_data = {}
+
+            code = (err_data.get("error_code") or "").lower()
+            msg = (err_data.get("error_description")
+                   or err_data.get("msg")
+                   or err_data.get("message")
+                   or f"HTTP {resp.status_code}")
+
+            if code == "invalid_credentials" or "Invalid login credentials" in msg:
+                exists = self._probe_email_exists(base_url, email)
+
+                if exists is True:
+                    self._set_input_error(self.pwd_input, True)
+                    self.tip_label.setMinimumHeight(64)
+                    self.tip_label.setText(
+                        '该邮箱已注册，但<b>密码不正确</b>。<br>'
+                        '· <a href="reset" style="color:#10B981;">重置密码</a><br>'
+                        '· 或检查大小写、输入法空格后重试'
+                    )
+                elif exists is False:
+                    self._set_input_error(self.email_input, True)
+                    self.tip_label.setMinimumHeight(48)
+                    self.tip_label.setText(
+                        '该邮箱<b>尚未注册</b>。<br>'
+                        '<a href="register" style="color:#10B981;">→ 立即注册</a>'
+                    )
+                else:
+                    self._set_input_error(self.email_input, True)
+                    self._set_input_error(self.pwd_input, True)
+                    self.tip_label.setMinimumHeight(64)
+                    self.tip_label.setText(
+                        '邮箱或密码错误。<br>'
+                        '· 还没注册？<a href="register" style="color:#10B981;">立即注册</a><br>'
+                        '· 忘记密码？<a href="reset" style="color:#10B981;">重置密码</a>'
+                    )
+                return
+
+            if code == "email_not_confirmed" or "Email not confirmed" in msg:
+                self._set_input_error(self.email_input, True)
+                self.tip_label.setMinimumHeight(48)
+                self.tip_label.setText(
+                    '账号存在，但邮箱还没验证。<br>'
+                    '请查收验证邮件；没收到？'
+                    '<a href="resend_verify" style="color:#10B981;">重新发送</a>'
+                )
+                return
+
+            if code == "user_banned" or "banned" in msg.lower():
+                self._show_error("账号已被停用，请联系管理员")
+                return
+            if resp.status_code == 429 or "rate" in code:
+                self._show_error("操作过于频繁，请稍后再试")
+                return
+            if resp.status_code >= 500:
+                self._show_error(f"服务端异常 (HTTP {resp.status_code})，请稍后重试")
+                return
+
+            self._show_error(f"登录失败：{msg}")
             return
 
-        auth_data = resp.json()
+        # ---------- 成功分支 ----------
+        try:
+            auth_data = resp.json()
+        except Exception:
+            self._show_error("登录失败：响应解析异常")
+            return
+
         access_token = auth_data.get("access_token")
         refresh_token = auth_data.get("refresh_token")
         if not access_token:
@@ -344,11 +446,15 @@ class LoginWindow(QDialog):
 
         device_id = get_machine_id()
         func_url = f"{base_url}/functions/v1/verify-license"
-        func_headers = {"Authorization": f"Bearer {access_token}", "apikey": SUPABASE_ANON_KEY,
-                        "Content-Type": "application/json"}
+        func_headers = {
+            "Authorization": f"Bearer {access_token}",
+            "apikey": SUPABASE_ANON_KEY,
+            "Content-Type": "application/json",
+        }
 
         try:
-            resp_func = httpx.post(func_url, json={"device_id": device_id}, headers=func_headers, timeout=30.0)
+            resp_func = httpx.post(func_url, json={"device_id": device_id},
+                                   headers=func_headers, timeout=30.0)
         except Exception as e:
             self._show_error(f"授权校验网络异常：{e}")
             return
@@ -357,15 +463,22 @@ class LoginWindow(QDialog):
             self._show_error(f"授权校验请求失败 (HTTP {resp_func.status_code})")
             return
 
-        result = resp_func.json()
+        try:
+            result = resp_func.json()
+        except Exception:
+            self._show_error("授权校验响应解析异常")
+            return
 
         if not result.get("ok"):
             reason = result.get("reason", "")
             if reason == "device_limit_reached":
                 max_dev = result.get("max", 1)
-                reply = QMessageBox.question(self, "设备达到上限",
-                                             f"当前账号最多绑 {max_dev} 台设备。\n是否解绑【最早登录的旧设备】以继续？",
-                                             QMessageBox.Yes | QMessageBox.No)
+                reply = QMessageBox.question(
+                    self, "设备达到上限",
+                    f"当前账号最多绑 {max_dev} 台设备。\n"
+                    f"是否解绑【最早登录的旧设备】以继续？",
+                    QMessageBox.Yes | QMessageBox.No
+                )
                 if reply == QMessageBox.Yes:
                     self._do_reset_device(base_url, func_headers)
                 return
@@ -379,14 +492,20 @@ class LoginWindow(QDialog):
             return
 
         expires_at = result.get("expires_at")
-        user_data = auth_data.get("user", {})
+        user_data = auth_data.get("user", {}) or {}
         user_id = user_data.get("id", "")
 
-        metadata = user_data.get("user_metadata", {})
+        metadata = user_data.get("user_metadata", {}) or {}
         default_nickname = f"用户_{user_id[:8]}" if user_id else "未知用户"
         nickname = metadata.get("nickname") or default_nickname
 
+        # 1. 保存身份信息并生成路径
         self._save_auth_info(email, nickname, user_id, refresh_token, expires_at)
+
+        # 2. 设置当前用户，并初始化该用户的数据库（建表）
+        from db_config import set_current_user, init_db
+        set_current_user(user_id)
+        init_db()
 
         from license_manager import license_mgr
         license_mgr.refresh_status()
@@ -401,41 +520,102 @@ class LoginWindow(QDialog):
 
         self.accept()
 
+    # ================= 邮箱存在性探测 =================
+
+    def _probe_email_exists(self, base_url, email):
+        now = time.time()
+        if now - self._probe_window_start > 60:
+            self._probe_window_start = now
+            self._probe_count = 0
+        self._probe_count += 1
+        if self._probe_count > 5:
+            return None
+
+        try:
+            r = httpx.post(
+                f"{base_url}/rest/v1/rpc/email_exists",
+                headers={
+                    "apikey": SUPABASE_ANON_KEY,
+                    "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={"p_email": email},
+                timeout=8.0,
+            )
+            if r.status_code == 200:
+                return bool(r.json())
+            print(f"[probe] email_exists 返回 {r.status_code}: {r.text[:200]}")
+            return None
+        except Exception as e:
+            print(f"[probe] email_exists 异常: {e}")
+            return None
+
+    # ================= 设备解绑 =================
+
     def _do_reset_device(self, base_url, func_headers):
         reset_url = f"{base_url}/functions/v1/reset-devices"
         try:
             reset_resp = httpx.post(reset_url, headers=func_headers, timeout=30.0)
-            if reset_resp.status_code == 200 and reset_resp.json().get("ok"):
-                self._show_error("已解绑最早设备！请再次点击“登录”。")
-            else:
-                r_json = reset_resp.json()
-                if r_json.get("reason") == "cooldown":
-                    self._show_error(f"解绑失败：冷却中，还需等待 {r_json.get('days_left')} 天。")
-                else:
-                    self._show_error(f"解绑失败：{r_json}")
         except Exception as e:
             self._show_error(f"解绑网络异常：{e}")
+            return
+
+        try:
+            r_json = reset_resp.json()
+        except Exception:
+            r_json = {}
+
+        if reset_resp.status_code == 200 and r_json.get("ok"):
+            self._show_error("已解绑最早设备！请再次点击“登录”。")
+        elif r_json.get("reason") == "cooldown":
+            self._show_error(f"解绑失败：冷却中，还需等待 {r_json.get('days_left')} 天。")
+        else:
+            self._show_error(f"解绑失败：{r_json}")
+
+    # ================= 保存登录信息 / UI 状态 =================
 
     def _save_auth_info(self, email, nickname, user_id, refresh_token, expires_at):
+        """把凭证保存在该用户自己的目录下，并根据勾选决定是否记录自动登录 Session"""
         try:
+            # 1. 确保当前用户的专属文件夹存在
+            user_dir = get_user_dir(user_id)
+            auth_file = os.path.join(user_dir, "auth.json")
+
             data = {
                 "email": email,
                 "nickname": nickname,
                 "user_id": user_id,
                 "refresh_token": refresh_token,
-                "expires_at": expires_at
+                "expires_at": expires_at,
             }
-            with open(_auth_cache_path(), "w", encoding="utf-8") as f:
-                json.dump(data, f)
-        except Exception:
-            pass
+            # 写入专属的 auth.json
+            with open(auth_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+
+            # 2. 如果勾选了“记住登录”，写一个全局的 session.json 指针
+            if self.remember_cb.isChecked():
+                session_data = {
+                    "user_id": user_id,
+                    "email": email
+                }
+                with open(get_session_path(), "w", encoding="utf-8") as f:
+                    json.dump(session_data, f, ensure_ascii=False, indent=2)
+            else:
+                # 如果没勾选，清空之前的指针
+                if os.path.exists(get_session_path()):
+                    os.remove(get_session_path())
+
+        except Exception as e:
+            print(f"[Login] 保存凭证失败: {e}")
 
     def _set_loading(self, loading: bool):
         self.main_btn.setEnabled(not loading)
-        self.main_btn.setText("处理中..." if loading else ("注 册" if self.is_register_mode else "登 录"))
+        self.main_btn.setText("处理中..." if loading else
+                              ("注 册" if self.is_register_mode else "登 录"))
         self.email_input.setEnabled(not loading)
         self.pwd_input.setEnabled(not loading)
         QApplication.processEvents()
 
     def _show_error(self, msg: str):
+        self.tip_label.setMinimumHeight(32)
         self.tip_label.setText(msg)
