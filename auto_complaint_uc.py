@@ -1,12 +1,17 @@
+# auto_complaint_uc.py
 import time
 import re
 import os
-from openpyxl import Workbook
-from playwright.sync_api import sync_playwright
 from PySide6.QtCore import QObject, Signal
 
-from app_paths import get_user_dir
+from app_paths import get_user_dir, DIR_TEMP, TEMP_EXCEL_TPL
 from db_config import get_current_user
+from browser_manager import BrowserManager
+from complaint_excel_utils import generate_platform_excel
+from complaint_common import DESC_TEMPLATE, take_error_screenshot
+
+# ★ 模块代号常量
+from app_data import MODULE_SEARCH, MODULE_NETDISK, MODULE_TOUTIAO, MODULE_OTHER, PLATFORM_UC
 
 
 class AutoComplaintSignals(QObject):
@@ -14,25 +19,18 @@ class AutoComplaintSignals(QObject):
 
 
 def check_and_wait_login(page, signals, stop_event, login_event, dialog_signal):
-    """
-    检测是否登录。UC 和夸克共用底层登录逻辑。
-    """
     while True:
         if stop_event.is_set():
             return False
-
         try:
             page.wait_for_load_state("networkidle", timeout=5000)
         except:
             pass
 
-        # 1. 检查是否有登录弹窗（基于你提供的DOM：div.box 或 iframe#quarkIframe）
         is_unlogged = page.locator("div.box, iframe#quarkIframe").count() > 0
-
         if is_unlogged:
-            pass  # 明确未登录
+            pass
         else:
-            # 2. 没登录框，尝试等待右上角的“UC用户”出现
             try:
                 page.wait_for_selector("span.user.ant-dropdown-trigger", timeout=5000)
                 user_span = page.locator("span.user.ant-dropdown-trigger").first
@@ -48,7 +46,8 @@ def check_and_wait_login(page, signals, stop_event, login_event, dialog_signal):
 
         login_event.wait()
         login_event.clear()
-
+        if stop_event.is_set():
+            return False
         if dialog_signal:
             dialog_signal.reset_progress()
 
@@ -60,8 +59,8 @@ def check_and_wait_login(page, signals, stop_event, login_event, dialog_signal):
             pass
 
 
-def run_auto_complaint_uc(complaints_data, signals: AutoComplaintSignals = None, is_all=False,
-                          stop_event=None, login_event=None, dialog_signal=None):
+def run_auto_complaint_uc(complaints_data, signals=None, is_all=False, stop_event=None, login_event=None,
+                          dialog_signal=None):
     def log(msg):
         print(msg)
         if signals:
@@ -74,49 +73,24 @@ def run_auto_complaint_uc(complaints_data, signals: AutoComplaintSignals = None,
     user_dir = get_user_dir(user_id)
 
     log("正在生成临时 Excel...")
-    # 文件和夸克区分开，避免冲突
-    temp_excel_path = os.path.join(user_dir, "temp", "temp_uc_import.xlsx")
-
-    try:
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "Sheet1"
-        ws.cell(row=1, column=1, value="侵权链接")
-        ws.cell(row=1, column=2, value="原创链接")
-        ws.cell(row=1, column=3, value="作品名（选填）")
-        start_row = 2
-
-        for row_idx, item in enumerate(complaints_data, start=start_row):
-            url = item["url"]
-            book_name = item["book"]
-            p_id = item.get("platform_id", "")
-            original_url = f"https://www.jjwxc.net/onebook.php?novelid={p_id}" if p_id else "https://www.jjwxc.net/"
-
-            ws.cell(row=row_idx, column=1, value=url)
-            ws.cell(row=row_idx, column=2, value=original_url)
-            ws.cell(row=row_idx, column=3, value=book_name)
-
-        wb.save(temp_excel_path)
-    except Exception as e:
-        log(f"❌ 生成临时 Excel 失败: {e}")
+    temp_excel_path = os.path.join(user_dir, DIR_TEMP, TEMP_EXCEL_TPL.format(platform=PLATFORM_UC))
+    if not generate_platform_excel(complaints_data, PLATFORM_UC, temp_excel_path):
+        log("❌ 生成临时 Excel 失败")
         return False
 
-    p = sync_playwright().start()
-    browser = None
+    page = None
     try:
-        # 用户数据目录区分开
-        user_data_dir = os.path.join(user_dir, "login_uc_data")
-        browser = p.chromium.launch_persistent_context(
-            user_data_dir=user_data_dir,
-            headless=False,
-            args=["--start-maximized"]
-        )
-        page = browser.pages[0]
+        log("正在唤醒统一浏览器...")
+        try:
+            bm = BrowserManager.instance()
+            page = bm.new_page()
+        except Exception as launch_err:
+            log(f"❌ 浏览器启动失败: {launch_err}")
+            return False
 
         log("正在打开 UC 投诉主页...")
-        page.goto("https://ipp.uc.cn/#/home")
+        page.goto("https://ipp.uc.cn/#/home", wait_until="domcontentloaded", timeout=30000)
 
-        # ★ 核心：前置登录检测
         if not check_and_wait_login(page, signals, stop_event, login_event, dialog_signal):
             log("用户中断了脚本。")
             return False
@@ -149,7 +123,6 @@ def run_auto_complaint_uc(complaints_data, signals: AutoComplaintSignals = None,
                     page.wait_for_timeout(500)
                     dropdown.click(force=True)
                     page.wait_for_timeout(1500)
-
                     option = page.locator(".ant-select-dropdown-menu-item").filter(has_text=first_holder).first
                     if option.count() > 0 and option.is_visible():
                         option.click(force=True)
@@ -162,39 +135,37 @@ def run_auto_complaint_uc(complaints_data, signals: AutoComplaintSignals = None,
                 log(f"⚠️ 自动选择权利人失败: {e}")
 
         try:
-            # UC 的投诉类型和内容类型文案与夸克一致
             page.get_by_text("知识产权").click(timeout=3000)
             page.get_by_text("著作权(含视频、图文、图集等)").click(timeout=3000)
         except:
             pass
 
-        # ★ 核心修改：功能模块的智能匹配（忽略大小写，兼容各种叫法）
-        first_cat = complaints_data[0].get("cat", "").lower()  # 统一转小写方便比对
+        # ★ 核心修复：基于 module_code 严格选择，放弃容错，点不到立刻报错
+        module_code = complaints_data[0].get("module_code", MODULE_OTHER)
+        log(f"正在选择功能模块，当前识别模块代号: {module_code}")
+
         try:
-            if "网盘" in first_cat:
-                # 夸克网盘、UC网盘、uc网盘等
-                page.get_by_text("UC网盘", exact=True).click(timeout=3000)
-                log(f"✅ 识别到【网盘】类侵权，已选择：UC网盘")
-            elif "搜索" in first_cat or "神马" in first_cat:
-                # 夸克搜索、神马搜索、UC搜索等
-                page.get_by_text("神马搜索", exact=True).click(timeout=3000)
-                log(f"✅ 识别到【搜索】类侵权，已选择：神马搜索")
-            elif "头条" in first_cat:
-                # 头条内容等
-                page.get_by_text("头条内容", exact=True).click(timeout=3000)
-                log(f"✅ 识别到【头条】类侵权，已选择：头条内容")
+            if module_code == MODULE_NETDISK:
+                page.get_by_text("UC网盘", exact=True).click(timeout=5000)
+                log("✅ 已选择：UC网盘")
+            elif module_code == MODULE_SEARCH:
+                page.get_by_text("神马搜索", exact=True).click(timeout=5000)
+                log("✅ 已选择：神马搜索")
+            elif module_code == MODULE_TOUTIAO:
+                page.get_by_text("头条内容", exact=True).click(timeout=5000)
+                log("✅ 已选择：头条内容")
             else:
-                log(f"❌ 未知的平台类型: {first_cat}，请检查数据源！为防止投诉到错误模块，脚本已停止。")
+                log(f"❌ 未知的模块代号: {module_code}，为防止投错，脚本已停止。")
                 return False
         except Exception as e:
-            log(f"⚠️ 选择功能模块失败: {e}")
+            log(f"❌ 选择功能模块失败，找不到对应选项，脚本已停止: {e}")
             return False
 
         try:
-            # 内容类型选小说
             page.get_by_text("小说", exact=True).click(timeout=3000)
-        except:
-            pass
+            log("✅ 已选择：小说")
+        except Exception as e:
+            log(f"⚠️ 选择“小说”失败，继续执行... ({e})")
 
         if stop_event.is_set(): return False
 
@@ -202,11 +173,9 @@ def run_auto_complaint_uc(complaints_data, signals: AutoComplaintSignals = None,
         try:
             page.locator("a.multi-add").first.click()
             page.wait_for_timeout(2000)
-
             with page.expect_file_chooser() as fc_info:
                 btn_upload = page.locator("button.ant-btn-sm:has-text('上传文件'), button:has-text('上传文件')").first
                 btn_upload.click()
-
             file_chooser = fc_info.value
             file_chooser.set_files(os.path.abspath(temp_excel_path))
             page.wait_for_timeout(4000)
@@ -226,22 +195,7 @@ def run_auto_complaint_uc(complaints_data, signals: AutoComplaintSignals = None,
         log("正在填写投诉描述...")
         try:
             first_item = complaints_data[0]
-            book_name = first_item.get("book", "未知作品")
-            aliases = first_item.get("aliases", "")
-            p_id = first_item.get("platform_id", "")
-
-            name_str = f"《{book_name}（原名：{aliases}）》" if aliases else f"《{book_name}》"
-            url_str = f"https://www.jjwxc.net/onebook.php?novelid={p_id}" if p_id else ""
-
-            desc_text = (
-                f"晋江文学城授权作品{name_str}，"
-                f"首发网址：{url_str} ，"
-                f"被盗文网站非法获取，贵站出现大量盗文txt分享，持续侵犯作者的个人利益。"
-                f"作者已经按照规则提交了作者的作品授权书，首发平台截图和后台截图，"
-                f"希望贵站能够严肃处理这一问题，删除原帖和txt分享链接。"
-            )
-
-            # UC的placeholder与夸克一致
+            desc_text = DESC_TEMPLATE.format(name_str=first_item["name_str"], url_str=first_item["url_str"])
             desc_textarea = page.locator("textarea[placeholder*='请客观公正描述']")
             if desc_textarea.count() > 0:
                 desc_textarea.fill(desc_text)
@@ -249,13 +203,10 @@ def run_auto_complaint_uc(complaints_data, signals: AutoComplaintSignals = None,
         except Exception as e:
             log(f"填写描述失败: {e}")
 
-        # ==================== 证明材料上传 ====================
         pdf_path = complaints_data[0].get("evidence_path", "")
         log(f"正在准备上传证明材料，路径: {pdf_path}")
-
         if pdf_path and os.path.exists(pdf_path):
             try:
-                # 找到第一个“点击上传”
                 upload_btn = page.locator("p", has_text="点击上传").first
                 if upload_btn.count() > 0:
                     log("找到【证明文件】上传框，正在模拟点击并注入文件...")
@@ -263,12 +214,9 @@ def run_auto_complaint_uc(complaints_data, signals: AutoComplaintSignals = None,
                         upload_btn.click(force=True)
                     file_chooser = fc_info.value
                     file_chooser.set_files(os.path.abspath(pdf_path))
-
-                    # 等待 Toast 提示出现（与你提供的截图3完全对应）
                     try:
                         page.wait_for_selector("div.ant-message:has-text('上传成功')", timeout=10000)
                         log("🎉 检测到“上传成功” Toast 提示，文件已挂载！")
-                        # 等待Toast消失，防止遮挡提交按钮
                         page.wait_for_selector("div.ant-message:has-text('上传成功')", state="hidden", timeout=5000)
                     except Exception:
                         log("⚠️ 未检测到“上传成功”提示，但文件可能已塞入，继续尝试提交...")
@@ -278,7 +226,6 @@ def run_auto_complaint_uc(complaints_data, signals: AutoComplaintSignals = None,
                 log(f"❌ PDF上传过程发生异常: {e}")
         else:
             log(f"⚠️ 本地证明材料文件不存在或为空，跳过上传。")
-        # =====================================================
 
         if stop_event.is_set(): return False
 
@@ -289,18 +236,13 @@ def run_auto_complaint_uc(complaints_data, signals: AutoComplaintSignals = None,
         log("准备点击【提交】...")
         submit_ok = False
         try:
-            # 你的DOM明确显示: <span>提 交</span>，用正则匹配空格
             btn_submit = page.locator("button.ant-btn-primary").filter(has_text=re.compile(r"提\s*交")).last
             btn_submit.scroll_into_view_if_needed()
             page.wait_for_timeout(1000)
-
             log("正在执行真实鼠标点击...")
             btn_submit.click(force=True)
-
             log("✅ 已触发提交，等待响应...")
             page.wait_for_timeout(2000)
-
-            # 二次确认弹窗（如果有）
             try:
                 confirm_btn = page.locator("button.ant-btn-primary:visible").filter(
                     has_text=re.compile("确定|确认")).first
@@ -315,18 +257,11 @@ def run_auto_complaint_uc(complaints_data, signals: AutoComplaintSignals = None,
             page.wait_for_selector("text=提交成功", timeout=15000)
             log("🎉 检测到「提交成功」弹窗，本批次投诉确认成功！")
             submit_ok = True
-
         except Exception as e:
             log(f"❌ 提交失败或未检测到成功提示: {e}")
-            try:
-                error_screenshot_dir = os.path.join(user_dir, "error_screenshots")
-                os.makedirs(error_screenshot_dir, exist_ok=True)
-                ts = time.strftime("%Y%m%d_%H%M%S")
-                screenshot_path = os.path.join(error_screenshot_dir, f"uc_fail_{ts}.png")
-                page.screenshot(path=screenshot_path, full_page=True)
-                log(f"📸 已保存失败现场截图: {screenshot_path}")
-            except:
-                pass
+            shot_path = take_error_screenshot(page, user_dir, "uc")
+            if shot_path:
+                log(f"📸 已保存失败现场截图: {shot_path}")
 
         if not submit_ok:
             return False
@@ -334,11 +269,10 @@ def run_auto_complaint_uc(complaints_data, signals: AutoComplaintSignals = None,
         if is_all:
             log("✅ 提交完成！正在刷新页面回到首页，准备处理下一批...")
             page.wait_for_timeout(2000)
-            page.goto("https://ipp.uc.cn/#/home")
-            page.wait_for_load_state("networkidle", timeout=15000)
+            page.goto("https://ipp.uc.cn/#/home", wait_until="domcontentloaded")
             return True
         else:
-            log("👉 单次投诉模式，请确认结果后【手动关闭浏览器窗口】。")
+            log("👉 单次投诉模式，请确认结果。")
             return True
 
     except Exception as e:
@@ -350,12 +284,4 @@ def run_auto_complaint_uc(complaints_data, signals: AutoComplaintSignals = None,
                 os.remove(temp_excel_path)
             except:
                 pass
-        if browser:
-            if is_all and not stop_event.is_set():
-                try:
-                    browser.close()
-                except:
-                    pass
-            else:
-                print("（浏览器已保留，未自动关闭）")
-        p.stop()
+        print("（UC 任务结束，浏览器生命周期由调度器统一管理）")

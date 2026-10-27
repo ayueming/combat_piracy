@@ -3,7 +3,7 @@ import os
 import json
 import httpx
 
-from app_paths import get_session_path, get_user_dir
+from app_paths import get_session_path, get_user_dir, FILE_AUTH
 from login_device_id import get_machine_id
 from config import SUPABASE_URL, SUPABASE_ANON_KEY
 
@@ -30,7 +30,7 @@ def try_auto_login() -> str | None:
         return None
 
     try:
-        auth_file = os.path.join(get_user_dir(user_id), "auth.json")
+        auth_file = os.path.join(get_user_dir(user_id), FILE_AUTH)
     except Exception:
         _safe_remove(session_path)
         return None

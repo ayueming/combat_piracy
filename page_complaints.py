@@ -1,3 +1,4 @@
+# page_complaints.py
 import os
 import threading
 import time
@@ -9,12 +10,33 @@ from PySide6.QtCore import Qt, Signal
 from datetime import datetime
 from db_config import get_conn
 
-# === ★ 引入所有平台的脚本 ===
-from auto_complaint_quark import run_auto_complaint as run_quark, AutoComplaintSignals
-from auto_complaint_uc import run_auto_complaint_uc as run_uc
-from auto_complaint_baidu import run_auto_complaint_baidu as run_baidu
+# === ★ 统一调度器 ===
+from complaint_dispatcher import ComplaintDispatcher, PLATFORM_ROUTER
 
 from license_manager import license_mgr
+
+# ★ 引入独立的历史记录组件
+from complaint_history import ComplaintHistoryWidget
+
+# ★ 引入 Excel 生成工具
+from complaint_excel_utils import generate_platform_excel
+
+# ★ 引入投诉业务常量
+from app_data import COMPLAINT_BATCH_SIZE, PLATFORM_BAIDU
+
+# ★ 按钮/表格样式统一从 ui_styles 引入
+from ui_styles import (
+    BTN_SECONDARY,
+    BTN_SECONDARY_DARK,
+    BTN_PRIMARY,
+    BTN_DARK,
+    BTN_DANGER,
+    TABLE_READONLY,
+    TABLE_READONLY_ALT,
+    HEADER_BASE,
+    LIST_BASE,
+    TAB_WIDGET,
+)
 
 
 # ============================================================
@@ -22,11 +44,11 @@ from license_manager import license_mgr
 # ============================================================
 class ProcessDialog(QDialog):
     closed_by_user = Signal()
-    login_confirmed = Signal()  # ★ 新增：用户点击已登录
+    login_confirmed = Signal()
 
     def __init__(self, parent=None):
         super().__init__(None)
-        self.setFixedSize(520, 260)  # 略微增加高度以容纳新按钮
+        self.setFixedSize(520, 260)
         self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.setAttribute(Qt.WA_ShowWithoutActivating, True)
         self.setFocusPolicy(Qt.NoFocus)
@@ -98,7 +120,7 @@ class ProcessDialog(QDialog):
         self.login_btn.clicked.connect(self._on_login_clicked)
         c_layout.addWidget(self.login_btn)
 
-        self.tip = QLabel("关闭本窗口或浏览器，将强行终止本脚本。\n（仅关闭本脚本不会关闭浏览器）")
+        self.tip = QLabel("关闭本窗口或浏览器，将强行终止本脚本。\n（仅关闭小窗不会关闭浏览器）")
         self.tip.setAlignment(Qt.AlignCenter)
         self.tip.setWordWrap(True)
         self.tip.setStyleSheet("color: #999; font-size: 11px; border: none; background: transparent;")
@@ -156,7 +178,7 @@ class ComplaintsPage(QWidget):
         self.main_window = main_window
         self.batches = []
         self.auto_running = False
-        self.current_signals = None
+        self.dispatcher = None
         self.progress_dialog = None
 
         # ★ 线程间通信的事件控制
@@ -173,13 +195,9 @@ class ComplaintsPage(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 20, 20, 20)
 
+        # ★ 使用 TAB_WIDGET
         self.tabs = QTabWidget()
-        self.tabs.setStyleSheet("""
-            QTabWidget::pane { border: 1px solid #DCDCDC; background: #FFFFFF; top: -1px; }
-            QTabBar::tab { background: #F5F5F5; color: #666666; padding: 8px 24px; border: 1px solid #DCDCDC; border-bottom: none; border-top-left-radius: 6px; border-top-right-radius: 6px; margin-right: 2px; }
-            QTabBar::tab:hover { background: #EBEBEB; }
-            QTabBar::tab:selected { background: #FFFFFF; color: #1F1F1F; font-weight: bold; border-bottom: 1px solid #FFFFFF; }
-        """)
+        self.tabs.setStyleSheet(TAB_WIDGET)
         layout.addWidget(self.tabs)
 
         # ================= Tab 1: 投诉队列 =================
@@ -187,15 +205,12 @@ class ComplaintsPage(QWidget):
         queue_layout = QVBoxLayout(self.queue_tab)
 
         top_layout = QHBoxLayout()
-        top_layout.addWidget(QLabel("【投诉批次中心】 系统已按“分类 + 书籍”智能拆分（单批上限200条）。"))
+        lbl_center = QLabel(f"【投诉批次中心】 系统已智能拆分（单批上限{COMPLAINT_BATCH_SIZE}条）。")
+        top_layout.addWidget(lbl_center)
         top_layout.addStretch()
 
         self.clear_btn = QPushButton("清空当前批次")
-        self.clear_btn.setStyleSheet("""
-            QPushButton { border: 1px solid #DCDFE6; border-radius: 4px; padding: 4px 12px; background: #FFF; color: #606266; }
-            QPushButton:hover { border-color: #1F1F1F; color: #1F1F1F; }
-            QPushButton:disabled { color: #BBB; border-color: #EEE; }
-        """)
+        self.clear_btn.setStyleSheet(BTN_SECONDARY)
         self.clear_btn.clicked.connect(self.clear_batches)
         top_layout.addWidget(self.clear_btn)
         queue_layout.addLayout(top_layout)
@@ -210,11 +225,7 @@ class ComplaintsPage(QWidget):
         left_layout.addWidget(left_title)
 
         self.batch_list = QListWidget()
-        self.batch_list.setStyleSheet("""
-            QListWidget { border: 1px solid #E9ECEF; border-radius: 4px; outline: none; }
-            QListWidget::item { padding: 8px; border-bottom: 1px solid #F2F2F2; }
-            QListWidget::item:selected { background-color: #F5F5F5; color: #1F1F1F; font-weight: bold; border-left: 3px solid #1F1F1F; }
-        """)
+        self.batch_list.setStyleSheet(LIST_BASE)
         self.batch_list.currentRowChanged.connect(self.on_batch_selected)
         left_layout.addWidget(self.batch_list)
         splitter.addWidget(left_widget)
@@ -232,50 +243,35 @@ class ComplaintsPage(QWidget):
         self.queue_table.setHorizontalHeaderLabels(["关联作品", "分类", "侵权链接"])
         self.queue_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.queue_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.queue_table.setStyleSheet("""
-            QTableWidget { border: 1px solid #E9ECEF; border-radius: 4px; }
-            QHeaderView::section { background-color: #F8F9FA; font-weight: bold; padding: 6px; border: none; border-bottom: 1px solid #E9ECEF; }
-        """)
+        self.queue_table.setStyleSheet(TABLE_READONLY + HEADER_BASE)
         right_layout.addWidget(self.queue_table)
 
         btn_layout = QHBoxLayout()
         btn_layout.setSpacing(10)
 
+        # 1. 黑底全批投诉
         self.auto_all_btn = QPushButton("全批自动投诉 (循环提交)")
-        self.auto_all_btn.setStyleSheet("""
-            QPushButton { background-color: #1F1F1F; color: white; padding: 8px 16px; font-weight: bold; border-radius: 4px; border: none; }
-            QPushButton:hover { background-color: #333333; }
-            QPushButton:disabled { background-color: #9CA3AF; color: #E5E7EB; }
-        """)
+        self.auto_all_btn.setStyleSheet(BTN_DARK + "QPushButton { padding: 8px 16px; }")
         self.auto_all_btn.clicked.connect(lambda: self.trigger_auto_fill(is_all=True))
         btn_layout.addWidget(self.auto_all_btn)
 
+        # 2. 红底单批投诉
         self.auto_btn = QPushButton("单批自动填表")
-        self.auto_btn.setStyleSheet("""
-            QPushButton { background-color: #10B981; color: white; padding: 8px 16px; font-weight: bold; border-radius: 4px; border: none; }
-            QPushButton:hover { background-color: #059669; }
-            QPushButton:disabled { background-color: #9CA3AF; color: #E5E7EB; }
-        """)
+        self.auto_btn.setStyleSheet(BTN_DANGER + "QPushButton { padding: 8px 16px; }")
         self.auto_btn.clicked.connect(lambda: self.trigger_auto_fill(is_all=False))
         btn_layout.addWidget(self.auto_btn)
 
-        self.export_btn = QPushButton("导出为Excel")
-        self.export_btn.setStyleSheet("""
-            QPushButton { background-color: #FFFFFF; color: #333; padding: 8px 16px; font-weight: bold; border-radius: 4px; border: 1px solid #DCDFE6; }
-            QPushButton:hover { border-color: #1F1F1F; color: #1F1F1F; }
-            QPushButton:disabled { color: #9CA3AF; border-color: #E5E7EB; }
-        """)
-        self.export_btn.clicked.connect(self.export_current_batch)
-        btn_layout.addWidget(self.export_btn)
-
+        # 3. 绿底手动标记
         self.mark_done_btn = QPushButton("手动标记本批已投诉")
-        self.mark_done_btn.setStyleSheet("""
-            QPushButton { background-color: #E74C3C; color: white; padding: 8px 16px; font-weight: bold; border-radius: 4px; border: none; }
-            QPushButton:hover { background-color: #C0392B; }
-            QPushButton:disabled { background-color: #9CA3AF; color: #E5E7EB; }
-        """)
+        self.mark_done_btn.setStyleSheet(BTN_PRIMARY + "QPushButton { padding: 8px 16px; }")
         self.mark_done_btn.clicked.connect(self.mark_batch_done)
         btn_layout.addWidget(self.mark_done_btn)
+
+        # 4. 白底导出Excel
+        self.export_btn = QPushButton("导出为Excel")
+        self.export_btn.setStyleSheet(BTN_SECONDARY + "QPushButton { padding: 8px 16px; }")
+        self.export_btn.clicked.connect(self.export_current_batch)
+        btn_layout.addWidget(self.export_btn)
 
         right_layout.addLayout(btn_layout)
         splitter.addWidget(right_widget)
@@ -288,33 +284,12 @@ class ComplaintsPage(QWidget):
         # ================= Tab 2: 历史记录 =================
         self.history_tab = QWidget()
         history_layout = QVBoxLayout(self.history_tab)
+        history_layout.setContentsMargins(0, 0, 0, 0)
 
-        h_top_layout = QHBoxLayout()
-        h_top_layout.addWidget(QLabel("【历史投诉记录】 以下是您所有的投诉批次汇总。"))
-        h_top_layout.addStretch()
-        refresh_btn = QPushButton("刷新记录")
-        refresh_btn.setStyleSheet("""
-            QPushButton { border: 1px solid #DCDFE6; border-radius: 4px; padding: 4px 12px; background: #FFF; color: #606266; }
-            QPushButton:hover { border-color: #1F1F1F; color: #1F1F1F; }
-        """)
-        refresh_btn.clicked.connect(self.load_history)
-        h_top_layout.addWidget(refresh_btn)
-        history_layout.addLayout(h_top_layout)
-
-        self.history_table = QTableWidget()
-        self.history_table.setColumnCount(4)
-        self.history_table.setHorizontalHeaderLabels(["投诉时间", "关联作品", "分类", "投诉链接数量"])
-        self.history_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.history_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.history_table.setAlternatingRowColors(True)
-        self.history_table.setStyleSheet("""
-            QTableWidget { border: 1px solid #E9ECEF; border-radius: 4px; alternate-background-color: #FAFAFA; }
-            QHeaderView::section { background-color: #F8F9FA; font-weight: bold; padding: 6px; border: none; border-bottom: 1px solid #E9ECEF; }
-        """)
-        history_layout.addWidget(self.history_table)
+        self.history_widget = ComplaintHistoryWidget(self)
+        history_layout.addWidget(self.history_widget)
 
         self.tabs.addTab(self.history_tab, "历史记录")
-        self.load_history()
 
         self._set_running_ui(False)
 
@@ -348,12 +323,18 @@ class ComplaintsPage(QWidget):
 
     def _on_task_finished(self):
         self.auto_running = False
-        self.current_signals = None
+        self.dispatcher = None
 
         if getattr(self, "progress_dialog", None):
             try:
                 self.progress_dialog.closed_by_user.disconnect()
+            except Exception:
+                pass
+            try:
                 self.progress_dialog.login_confirmed.disconnect()
+            except Exception:
+                pass
+            try:
                 self.progress_dialog.close()
             except Exception:
                 pass
@@ -362,23 +343,26 @@ class ComplaintsPage(QWidget):
         self._set_running_ui(False)
 
     def _on_dialog_closed(self):
-        """用户点击了 ✕ 按钮"""
+        """用户点击了 ✕ 按钮：发送停止信号，并启动倒计时强行解锁"""
         if not self.auto_running:
             return
-        self.auto_running = False
 
-        # ★ 通知脚本停止，并唤醒可能挂起的线程让其自行退出
         self.stop_event.set()
         self.login_event.set()
-
-        self.current_signals = None
-        self._set_running_ui(False)
-        self.progress_dialog = None
         print("用户强行关闭了小窗，已发送停止信号（浏览器将保留）。")
+
+        # ★ 新增：给 UI 留个后门，如果 2 秒后后台还没发出 task_finished，就直接强制解锁
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(2000, self._force_unlock_ui)
+
+    def _force_unlock_ui(self):
+        """强行解锁 UI（防止后台线程因死锁无法发出 task_finished）"""
+        if self.auto_running:
+            print("⚠️ 检测到后台线程可能已死锁，强行解锁界面按钮。")
+            self._on_task_finished()
 
     def _on_login_confirmed(self):
         """用户点击了 已登录继续 按钮"""
-        # ★ 释放阻塞，让脚本重新检查
         self.login_event.set()
 
     def _on_batch_done(self, batch):
@@ -404,38 +388,11 @@ class ComplaintsPage(QWidget):
         else:
             self.queue_table.setRowCount(0)
 
-    # ==================== 历史记录 / 刷新 ====================
-    def load_history(self):
-        self.history_table.setRowCount(0)
-        conn = get_conn()
-        query = """
-                SELECT complaint_time, book_name, category, COUNT(*) as count
-                FROM sites
-                WHERE complaint_time IS NOT NULL AND complaint_time != ''
-                GROUP BY complaint_time, book_name, category
-                ORDER BY complaint_time DESC
-                """
-        records = conn.execute(query).fetchall()
-        conn.close()
-
-        for comp_time, book_name, cat, count in records:
-            row = self.history_table.rowCount()
-            self.history_table.insertRow(row)
-            self.history_table.setItem(row, 0, QTableWidgetItem(comp_time))
-            self.history_table.setItem(row, 1, QTableWidgetItem(book_name or "未关联"))
-            self.history_table.setItem(row, 2, QTableWidgetItem(cat or "未分类"))
-            count_item = QTableWidgetItem(str(count))
-            count_item.setTextAlignment(Qt.AlignCenter)
-            font = count_item.font()
-            font.setBold(True)
-            count_item.setFont(font)
-            count_item.setForeground(Qt.darkGreen)
-            self.history_table.setItem(row, 3, count_item)
-
+    # ==================== 刷新 ====================
     def do_refresh_links(self):
         if hasattr(self.main_window, 'links_page'):
             self.main_window.links_page.refresh_table()
-        self.load_history()
+        self.history_widget.load_history()
 
     # ==================== 批次管理 ====================
     def load_batches(self, batches):
@@ -476,8 +433,12 @@ class ComplaintsPage(QWidget):
             return
 
         if current_batch:
-            cat = current_batch[0].get("cat", "")
-            if "百度" in cat:
+            platform_code = current_batch[0].get("platform_code")
+            if not platform_code:
+                # 数据缺平台代号：不猜、不兜底，直接禁用全批按钮
+                self.auto_all_btn.setEnabled(False)
+                self.auto_all_btn.setText("平台代号缺失，无法全批")
+            elif platform_code == PLATFORM_BAIDU:
                 self.auto_all_btn.setEnabled(False)
                 self.auto_all_btn.setText("百度无法全批 (需手动)")
             else:
@@ -504,6 +465,7 @@ class ComplaintsPage(QWidget):
                 QMessageBox.warning(self, "提示", "首批数据为空，无法开始！")
                 return
             target_cat = self.batches[0][0].get("cat", "")
+            target_platform_code = self.batches[0][0].get("platform_code")
             initial_batch = None
         else:
             index = self.batch_list.currentRow()
@@ -515,21 +477,30 @@ class ComplaintsPage(QWidget):
                 QMessageBox.warning(self, "提示", "当前批次为空！")
                 return
             target_cat = initial_batch[0].get("cat", "")
+            target_platform_code = initial_batch[0].get("platform_code")
 
-        if is_all and "百度" in target_cat:
+        # ★ 平台代号缺失：不猜、不兜底，直接拦下
+        if not target_platform_code:
+            QMessageBox.critical(
+                self, "⛔ 数据异常",
+                f"当前批次【{target_cat}】缺少平台代号（platform_code）。\n\n"
+                f"这通常意味着该分类不在系统平台配置中，或批次数据不是由【盗文链接】页正常生成的。\n"
+                f"请检查分类是否正确，或重新从【盗文链接】页发起投诉。"
+            )
+            return
+
+        if is_all and target_platform_code == PLATFORM_BAIDU:
             QMessageBox.warning(self, "提示", "百度投诉需要频繁登录，无法无人值守全批运行，请使用单批填表！")
             return
 
         # === ★ 拦截暂未开通的投诉方式 ===
+        #   直接复用调度器的路由表判断，不在这里再维护一份平台列表
         if not is_all:
-            cat_lower = target_cat.lower()
-            is_supported = ("百度" in cat_lower or "uc" in cat_lower or "神马" in cat_lower or "夸克" in cat_lower)
-            if not is_supported:
+            if target_platform_code not in PLATFORM_ROUTER:
                 QMessageBox.warning(self, "暂未开通",
                                     f"当前选择的是【{target_cat}】分类，\n系统暂未开通该平台的自动投诉方式！")
                 return
 
-        # ★ 启动前清空状态位
         self.stop_event.clear()
         self.login_event.clear()
 
@@ -537,118 +508,27 @@ class ComplaintsPage(QWidget):
         self.progress_dialog.closed_by_user.connect(self._on_dialog_closed)
         self.progress_dialog.login_confirmed.connect(self._on_login_confirmed)
 
-        self.current_signals = AutoComplaintSignals()
-        self.current_signals.progress.connect(self.progress_dialog.update_text)
+        # ★ 统一调度器：内部自己创建 AutoComplaintSignals，并通过 progress_msg 转发
+        self.dispatcher = ComplaintDispatcher(
+            batches=self.batches,
+            is_all=is_all,
+            target_cat=target_cat,
+            initial_batch=initial_batch,
+            stop_event=self.stop_event,
+            login_event=self.login_event,
+            dialog_signal=self.progress_dialog,
+        )
+        self.dispatcher.progress_msg.connect(self.progress_dialog.update_text)
+        self.dispatcher.batch_success.connect(self.mark_specific_batch_done)
+        self.dispatcher.task_finished.connect(self._on_task_finished)
 
         self.auto_running = True
         self._set_running_ui(True)
 
-        t = threading.Thread(
-            target=self.run_task_thread,
-            args=(is_all, target_cat, initial_batch),
-        )
-        t.daemon = True
+        t = threading.Thread(target=self.dispatcher.run, daemon=True)
         t.start()
 
         self.progress_dialog.show()
-
-    def run_task_thread(self, is_all, target_cat, initial_batch):
-        try:
-            is_baidu = "百度" in target_cat
-            is_uc = "uc" in target_cat.lower() or "神马" in target_cat
-            is_quark = "夸克" in target_cat.lower()
-
-            if not is_all:
-                if initial_batch is None:
-                    return
-
-                if is_baidu:
-                    success = run_baidu(initial_batch, self.current_signals, is_all=False)
-                elif is_uc:
-                    success = run_uc(
-                        initial_batch, self.current_signals, is_all=False,
-                        stop_event=self.stop_event, login_event=self.login_event,
-                        dialog_signal=self.progress_dialog
-                    )
-                elif is_quark:
-                    success = run_quark(
-                        initial_batch, self.current_signals, is_all=False,
-                        stop_event=self.stop_event, login_event=self.login_event,
-                        dialog_signal=self.progress_dialog
-                    )
-                else:
-                    if self.current_signals:
-                        self.current_signals.progress.emit(f"⚠️ 暂未开通【{target_cat}】的自动投诉方式")
-                    success = False
-
-                if success:
-                    self.mark_specific_batch_done(initial_batch)
-            else:
-                queue_snapshot = list(self.batches)
-                total = len(queue_snapshot)
-
-                for idx, batch in enumerate(queue_snapshot):
-                    if not batch:
-                        continue
-
-                    if self.stop_event.is_set():
-                        print("检测到停止信号，中断全批任务。")
-                        break
-
-                    cat = batch[0].get("cat", "")
-                    book = batch[0].get("book", "未知作品")
-
-                    if "百度" in cat:
-                        if self.current_signals:
-                            self.current_signals.progress.emit("遇到百度批次，需人工介入，全批暂停！")
-                        break
-
-                    current_is_uc = "uc" in cat.lower() or "神马" in cat
-                    current_is_quark = "夸克" in cat.lower()
-
-                    # ★ 全批循环中的“暂未开通”跳过逻辑
-                    if not (current_is_uc or current_is_quark):
-                        if self.current_signals:
-                            self.current_signals.progress.emit(f"⚠️ 暂未开通【{cat}】的投诉方式，已跳过。")
-                        continue
-
-                    remaining = total - idx
-                    if self.current_signals:
-                        self.current_signals.progress.emit(
-                            f"正在处理: [{cat}] {book} (剩余 {remaining} 批)...")
-
-                    if current_is_uc:
-                        success = run_uc(
-                            batch, self.current_signals, is_all=True,
-                            stop_event=self.stop_event, login_event=self.login_event,
-                            dialog_signal=self.progress_dialog
-                        )
-                    elif current_is_quark:
-                        success = run_quark(
-                            batch, self.current_signals, is_all=True,
-                            stop_event=self.stop_event, login_event=self.login_event,
-                            dialog_signal=self.progress_dialog
-                        )
-
-                    if success:
-                        if self.current_signals:
-                            self.current_signals.progress.emit("本批提交成功！正在标记并进入下一批...")
-                        self.mark_specific_batch_done(batch)
-                        time.sleep(3)
-                    else:
-                        if self.current_signals:
-                            self.current_signals.progress.emit("本批提交失败或用户中断，全批任务暂停！")
-                        break
-
-        except Exception as e:
-            try:
-                if self.current_signals:
-                    self.current_signals.progress.emit(f"❌ 自动投诉线程异常: {e}")
-            except Exception:
-                pass
-        finally:
-            if self.auto_running:
-                self.task_finished.emit()
 
     def mark_specific_batch_done(self, batch):
         today = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -676,6 +556,14 @@ class ComplaintsPage(QWidget):
             return
 
         category_name = current_batch[0].get("cat", "未知分类")
+        platform_code = current_batch[0].get("platform_code")
+        if not platform_code:
+            QMessageBox.critical(
+                self, "⛔ 数据异常",
+                f"当前批次【{category_name}】缺少平台代号（platform_code），无法生成对应模板的 Excel。"
+            )
+            return
+
         book_name = current_batch[0].get("book", "未知作品")
         time_str = datetime.now().strftime("%Y%m%d%H%M")
         default_name = f"{book_name}_{category_name}投诉_{time_str}.xlsx"
@@ -684,43 +572,13 @@ class ComplaintsPage(QWidget):
         if not path:
             return
 
-        try:
-            import openpyxl
-            from openpyxl import Workbook
-            wb = Workbook()
-            ws = wb.active
-            ws.title = "Sheet1"
+        # ★ 改为传 platform_code，与四个自动脚本保持一致
+        success = generate_platform_excel(current_batch, platform_code, path)
 
-            is_baidu = "百度" in category_name
-
-            if is_baidu:
-                ws.cell(row=1, column=1, value="序号")
-                ws.cell(row=1, column=2, value="链接名称")
-                ws.cell(row=1, column=3, value="链接地址")
-
-                for row_idx, item in enumerate(current_batch, start=2):
-                    ws.cell(row=row_idx, column=1, value=row_idx - 1)
-                    ws.cell(row=row_idx, column=2, value="盗版链接")
-                    ws.cell(row=row_idx, column=3, value=item["url"])
-            else:
-                ws.cell(row=1, column=1, value="侵权链接")
-                ws.cell(row=1, column=2, value="原创链接")
-                ws.cell(row=1, column=3, value="作品名（选填）")
-
-                for row_idx, item in enumerate(current_batch, start=2):
-                    url = item["url"]
-                    b_name = item["book"]
-                    p_id = item.get("platform_id", "")
-                    original_url = f"https://www.jjwxc.net/onebook.php?novelid={p_id}" if p_id else "https://www.jjwxc.net/"
-
-                    ws.cell(row=row_idx, column=1, value=url)
-                    ws.cell(row=row_idx, column=2, value=original_url)
-                    ws.cell(row=row_idx, column=3, value=b_name)
-
-            wb.save(path)
+        if success:
             QMessageBox.information(self, "导出成功", f"已生成适用于【{category_name}】的 Excel 模板！")
-        except Exception as e:
-            QMessageBox.critical(self, "导出失败", str(e))
+        else:
+            QMessageBox.critical(self, "导出失败", "生成 Excel 时发生错误，请检查文件是否被占用。")
 
     def mark_batch_done(self):
         if license_mgr.is_expired:

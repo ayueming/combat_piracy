@@ -20,7 +20,7 @@ from config import SUPABASE_URL, SUPABASE_ANON_KEY, has_supabase_config
 from ui_components import draw_checkbox, CHECK_BOX_SIZE
 
 # ★ 引入新的路径管理工具
-from app_paths import get_user_dir, get_session_path
+from app_paths import get_user_dir, get_session_path, FILE_AUTH
 
 EMAIL_PATTERN = r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$'
 
@@ -579,7 +579,7 @@ class LoginWindow(QDialog):
         try:
             # 1. 确保当前用户的专属文件夹存在
             user_dir = get_user_dir(user_id)
-            auth_file = os.path.join(user_dir, "auth.json")
+            auth_file = os.path.join(user_dir, FILE_AUTH)
 
             data = {
                 "email": email,

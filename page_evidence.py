@@ -10,9 +10,11 @@ from PySide6.QtGui import QDesktopServices, QPixmap, QImageReader
 from db_config import get_conn, get_current_user
 
 # ★ 引入路径管理
-from app_paths import get_user_dir
+from app_paths import get_user_dir, get_user_subdir, DIR_EVIDENCES
 # ★ 引入权限管理器
 from license_manager import license_mgr
+# ★ 引入统一按钮样式
+from ui_styles import BTN_PRIMARY, BTN_DANGER, BTN_BLUE, BTN_ORANGE
 
 HOLDER_EVIDENCE_TYPES = {
     "id_card_front": "1、身份证-人像面",
@@ -38,10 +40,9 @@ def get_data_dir():
     """获取当前用户的专属证据文件夹"""
     user_id = get_current_user()
     if user_id:
-        data_dir = os.path.join(get_user_dir(user_id), "evidences")
-    else:
-        # 开发模式未登录时的兜底目录
-        data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "evidences_data")
+        return get_user_subdir(user_id, DIR_EVIDENCES)
+    # 开发模式未登录时的兜底目录
+    data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "evidences_data")
     os.makedirs(data_dir, exist_ok=True)
     return data_dir
 
@@ -83,29 +84,33 @@ class EvidenceWidget(QFrame):
             QFrame { background-color: #FFFFFF; border: 1px solid #E9ECEF; border-radius: 6px; }
             QFrame:hover { border: 1px solid #D0D0D0; }
         """)
-        # ★ 高度从 310 调整为 360，容纳两行按钮
-        self.setFixedSize(320, 360)
+        # ★ 改为允许收缩（最小宽度 260，高度固定 360），防止两个卡片把父窗口强行撑到 640+ 宽
+        self.setMinimumWidth(260)
+        self.setFixedHeight(360)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(15, 15, 15, 15)
         layout.setSpacing(10)
 
+        # ★ 修复：将基础样式（去边框、加粗、颜色、字号）统一应用，防止子类继承外层 QFrame 边框
         lbl_title = QLabel()
+        lbl_title.setStyleSheet("font-weight: bold; color: #1F1F1F; font-size: 13px; border: none;")
+
         if self.ev_type == "auth_pdf":
             html_text = (f'<span style="font-weight:bold; color:#1F1F1F; font-size:13px;">{title}</span> '
                          f'<span style="color:#999; font-size:11px;">(最好带公章)</span>')
             lbl_title.setText(html_text)
         else:
             lbl_title.setText(title)
-            lbl_title.setStyleSheet("font-weight: bold; color: #1F1F1F; font-size: 13px; border: none;")
+
         lbl_title.setWordWrap(True)
         layout.addWidget(lbl_title)
 
         self.img_label = QLabel()
         self.img_label.setAlignment(Qt.AlignCenter)
-        self.img_label.setFixedSize(288, 140)
+        self.img_label.setFixedSize(288, 140) # 图片区域固定大小防止过大
         self.img_label.setStyleSheet("background-color: #FAFAFA; border: 1px dashed #DCDCDC; border-radius: 4px;")
-        layout.addWidget(self.img_label)
+        layout.addWidget(self.img_label, 0, Qt.AlignHCenter)
 
         self.lbl_file = QLabel()
         self.lbl_file.setStyleSheet("color: #666; font-size: 11px; border: none;")
@@ -115,23 +120,13 @@ class EvidenceWidget(QFrame):
         self.btn_upload = QPushButton("上传/更新")
         self.btn_upload.setCursor(Qt.PointingHandCursor)
         self.btn_upload.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.btn_upload.setStyleSheet(BTN_PRIMARY)
         self.btn_upload.clicked.connect(self.upload_file)
 
         # ★ UI 权限控制：过期禁用上传
         if license_mgr.is_expired:
             self.btn_upload.setEnabled(False)
-            self.btn_upload.setStyleSheet("""
-                QPushButton { background-color: #E5E7EB; color: #9CA3AF; border: none; border-radius: 4px;
-                              padding: 6px 0px; font-size: 12px; font-weight: bold; }
-            """)
             self.btn_upload.setToolTip("会员已过期，无法上传或更新资料。请联系管理员续费。")
-        else:
-            self.btn_upload.setStyleSheet("""
-                QPushButton { background-color: #10B981; color: white; border: none; border-radius: 4px;
-                              padding: 6px 0px; font-size: 12px; font-weight: bold; }
-                QPushButton:hover { background-color: #059669; }
-                QPushButton:pressed { background-color: #047857; }
-            """)
         layout.addWidget(self.btn_upload)
 
         # ★ 第二行：下载 / 查看 / 删除
@@ -142,39 +137,21 @@ class EvidenceWidget(QFrame):
         self.btn_download = QPushButton("下载")
         self.btn_download.setCursor(Qt.PointingHandCursor)
         self.btn_download.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.btn_download.setStyleSheet("""
-            QPushButton { background-color: #F59E0B; color: white; border: none; border-radius: 4px;
-                          padding: 6px 0px; font-size: 12px; font-weight: bold; }
-            QPushButton:hover { background-color: #D97706; }
-            QPushButton:pressed { background-color: #B45309; }
-            QPushButton:disabled { background-color: #E5E7EB; color: #9CA3AF; border: none; }
-        """)
+        self.btn_download.setStyleSheet(BTN_ORANGE)
         self.btn_download.clicked.connect(self.download_file)
 
         # 3. 查看
         self.btn_view = QPushButton("查看")
         self.btn_view.setCursor(Qt.PointingHandCursor)
         self.btn_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.btn_view.setStyleSheet("""
-            QPushButton { background-color: #3B82F6; color: white; border: none; border-radius: 4px;
-                          padding: 6px 0px; font-size: 12px; font-weight: bold; }
-            QPushButton:hover { background-color: #2563EB; }
-            QPushButton:pressed { background-color: #1D4ED8; }
-            QPushButton:disabled { background-color: #E5E7EB; color: #9CA3AF; }
-        """)
+        self.btn_view.setStyleSheet(BTN_BLUE)
         self.btn_view.clicked.connect(self.view_file)
 
-        # 4. 删除（新增）
+        # 4. 删除
         self.btn_delete = QPushButton("删除")
         self.btn_delete.setCursor(Qt.PointingHandCursor)
         self.btn_delete.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.btn_delete.setStyleSheet("""
-            QPushButton { background-color: #EF4444; color: white; border: none; border-radius: 4px;
-                          padding: 6px 0px; font-size: 12px; font-weight: bold; }
-            QPushButton:hover { background-color: #DC2626; }
-            QPushButton:pressed { background-color: #B91C1C; }
-            QPushButton:disabled { background-color: #E5E7EB; color: #9CA3AF; }
-        """)
+        self.btn_delete.setStyleSheet(BTN_DANGER)
         self.btn_delete.setToolTip("删除当前资料（同时删除本地文件）")
         self.btn_delete.clicked.connect(self.delete_file)
 
@@ -325,7 +302,7 @@ class EvidenceWidget(QFrame):
         if self.file_path and os.path.exists(self.file_path):
             QDesktopServices.openUrl(QUrl.fromLocalFile(self.file_path))
 
-    # ★ 新增：删除当前证据
+    # ★ 删除当前证据
     def delete_file(self):
         type_name = EVIDENCE_TYPES.get(self.ev_type, "该资料")
         reply = QMessageBox.question(
@@ -457,6 +434,7 @@ class HolderTab(QWidget):
             lbl = QLabel("暂无可用于维权的权利人信息。\n请先在【作品管理】中为作品填写权利人名称。")
             lbl.setAlignment(Qt.AlignCenter)
             lbl.setStyleSheet("color: #999; padding: 30px; font-size: 14px;")
+            lbl.setWordWrap(True) # 防撑爆
             self.content_layout.addWidget(lbl)
             self.content_layout.addStretch()
             return
@@ -527,42 +505,24 @@ class BookTab(QWidget):
         top_layout.addStretch()
 
         self.view_weiquan_btn = QPushButton("预览已上传维权书")
-        self.view_weiquan_btn.setStyleSheet(
-            "QPushButton { background-color: #10B981; color: white; padding: 6px 16px; "
-            "border-radius: 4px; font-weight: bold; border: none; } "
-            "QPushButton:hover { background-color: #059669; }")
+        self.view_weiquan_btn.setStyleSheet(BTN_PRIMARY)
         self.view_weiquan_btn.clicked.connect(self.open_weiquan_pdf)
         top_layout.addWidget(self.view_weiquan_btn)
 
         self.export_pdf_btn = QPushButton("自动生成维权书上传本系统")
         self.export_pdf_btn.clicked.connect(self.save_to_weiquan_pdf)
+        self.export_pdf_btn.setStyleSheet(BTN_DANGER)
 
         self.export_docx_btn = QPushButton("导出维权书Word")
         self.export_docx_btn.clicked.connect(self.export_word)
+        self.export_docx_btn.setStyleSheet(BTN_BLUE)
 
         # ★ UI 层拦截：如果过期，禁用生成按钮
         if license_mgr.is_expired:
-            expired_style = """
-                QPushButton { background-color: #E5E7EB; color: #9CA3AF; 
-                padding: 6px 16px; border-radius: 4px; font-weight: bold; border: none; }
-            """
-            self.export_pdf_btn.setStyleSheet(expired_style)
             self.export_pdf_btn.setEnabled(False)
             self.export_pdf_btn.setToolTip("会员已过期，无法生成维权书。请联系管理员续费。")
-
-            self.export_docx_btn.setStyleSheet(expired_style)
             self.export_docx_btn.setEnabled(False)
             self.export_docx_btn.setToolTip("会员已过期，无法导出 Word。请联系管理员续费。")
-        else:
-            self.export_pdf_btn.setStyleSheet(
-                "QPushButton { background-color: #c0392b; color: white; padding: 6px 16px; "
-                "border-radius: 4px; font-weight: bold; border: none; } "
-                "QPushButton:hover { background-color: #962d22; }")
-
-            self.export_docx_btn.setStyleSheet(
-                "QPushButton { background-color: #3B82F6; color: white; padding: 6px 16px; "
-                "border-radius: 4px; font-weight: bold; border: none; } "
-                "QPushButton:hover { background-color: #2563EB; }")
 
         top_layout.addWidget(self.export_pdf_btn)
         top_layout.addWidget(self.export_docx_btn)
@@ -605,6 +565,7 @@ class BookTab(QWidget):
             lbl = QLabel("暂无作品，请先在【作品管理】添加作品。")
             lbl.setAlignment(Qt.AlignCenter)
             lbl.setStyleSheet("color: #999; padding: 30px; font-size: 14px;")
+            lbl.setWordWrap(True) # 防撑爆
             self.content_layout.addWidget(lbl)
             self.content_layout.addStretch()
             return

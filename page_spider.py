@@ -1,3 +1,26 @@
+# page_spider.py
+# ================================================================
+# ★ 待抓取页面分类维护说明
+# ----------------------------------------------------------------
+# 待抓取页显示的 sites 数据 = 从 sites 表中"排除"以下分类后的结果：
+#
+#   1. 在 PLATFORM_DOMAINS 注册过域名的分类
+#      （网盘 / 知道 / 贴吧 / 暂未开通 等，链接本身就是资源页，无需抓章节）
+#   2. 搜索引擎（百度搜索 / 夸克搜索 / uc搜索）
+#
+# 其余分类（如 "其他" 以及以后新增的小说站/资源站）视为
+# 【一般网站资源】，会出现在待抓取页，供抓取章节。
+#
+# 如果要让一个新分类【不进】待抓取页：
+#   → 去 app_data/complaint_platform_consts.py 的 PLATFORM_DOMAINS 里
+#     为该分类注册一个域名（顺便 PLATFORM_CONFIG 也要注册显示名），
+#     本文件会自动生效，无需改动。
+#
+# 如果要让一个新分类【进】待抓取页（普通小说站）：
+#   → 只在 PLATFORM_CONFIG 注册显示名，【不要】加进 PLATFORM_DOMAINS 即可。
+#
+# 排除名单的推导逻辑见 app_data/spider_consts.py。
+# ================================================================
 import sqlite3
 import time
 import re
@@ -7,7 +30,8 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QTable
                                QTableWidgetItem, QHeaderView, QMessageBox, QAbstractItemView,
                                QPushButton, QApplication, QComboBox, QLineEdit, QDialog,
                                QTableView, QFrame, QStyledItemDelegate, QStyle, QMenu,
-                               QListWidget, QListWidgetItem, QStylePainter, QStyleOptionComboBox)
+                               QListWidget, QListWidgetItem, QStylePainter, QStyleOptionComboBox,
+                               QSizePolicy)  # ★ 修复：补上 QSizePolicy
 from PySide6.QtCore import (Qt, QUrl, QPoint, QRect, QEvent,
                             QItemSelection, QItemSelectionModel, QTimer)
 from PySide6.QtGui import (QColor, QFont, QStandardItemModel, QStandardItem,
@@ -34,6 +58,9 @@ from ui_components import (
 
 # ★ 引入权限管理器
 from license_manager import license_mgr
+
+# ★ 待抓取页排除名单（从 PLATFORM_DOMAINS 推导，见 spider_consts.py）
+from app_data.spider_consts import NO_CHAPTER_CRAWL_CATEGORIES
 
 
 # ================= Spider 专属：状态下拉框与代理 =================
@@ -301,6 +328,9 @@ class SpiderHeaderView(QHeaderView):
         self.active_popup = None
         self.filtered_names = []
 
+        # ★ 记录按下坐标，用于区分拖拽和单击
+        self._press_pos = None
+
     def paintSection(self, painter, rect, logical_index):
         if logical_index == -1:
             painter.fillRect(rect, QColor(HEADER_BG_COLOR))
@@ -348,12 +378,24 @@ class SpiderHeaderView(QHeaderView):
             painter.restore()
 
     def mousePressEvent(self, event):
+        self._press_pos = event.pos()
+        super().mousePressEvent(event)
+
         logical_index = self.logicalIndexAt(event.pos())
         if logical_index == 0:
             self.toggle_all()
-        elif logical_index == 4:
-            self.show_name_filter(event.globalPos())
-        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        super().mouseReleaseEvent(event)
+
+        if event.button() == Qt.LeftButton and self._press_pos is not None:
+            logical_index = self.logicalIndexAt(event.pos())
+
+            # 判断：第 4 列，且没有发生明显拖拽（单击）
+            if logical_index == 4 and (event.pos() - self._press_pos).manhattanLength() <= 3:
+                self.show_name_filter(event.globalPos())
+
+            self._press_pos = None
 
     def toggle_all(self):
         parent_table = self.parent()
@@ -502,6 +544,7 @@ class SpiderPage(QWidget):
         main_title.setStyleSheet("font-size: 20px; font-weight: bold; color: #1F1F1F;")
         sub_title = QLabel("双击任意行的“页面链接”即可预览网页。勾选后点击右侧按钮开始提取章节。")
         sub_title.setStyleSheet("font-size: 13px; color: #888888;")
+        sub_title.setWordWrap(True) # ★ 加上防撑爆换行
         title_vbox.addWidget(main_title)
         title_vbox.addWidget(sub_title)
         title_layout.addLayout(title_vbox)
@@ -613,6 +656,7 @@ class SpiderPage(QWidget):
             QTableWidget { border: 1px solid #E9ECEF; background-color: #FFFFFF; }
             QTableWidget::item:selected { background-color: #E3F2FD; color: #333; }
         """)
+        self.source_table.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding) # ★ 防撑爆
         layout.addWidget(self.source_table)
 
         # ================= 4. 提取结果区 =================
@@ -651,6 +695,7 @@ class SpiderPage(QWidget):
         self.result_view.verticalHeader().setFixedWidth(35)
         self.result_view.selectionModel().selectionChanged.connect(self.on_result_selection_changed)
 
+        self.result_view.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding) # ★ 防撑爆
         layout.addWidget(self.result_view)
 
         # ================= 5. 保存按钮 =================
@@ -727,22 +772,32 @@ class SpiderPage(QWidget):
         conn = get_conn()
         cursor = conn.cursor()
 
-        query = '''SELECT s.id, \
-                          COALESCE(b.name, s.book_name) as real_book_name, \
-                          s.category, \
-                          s.site_url, \
-                          s.name, \
-                          s.attr, \
-                          s.crawl_status, \
-                          s.resource_status, \
-                          s.complaint_time
-                   FROM sites s
-                            LEFT JOIN books b ON s.book_id = b.id
-                   WHERE s.category NOT IN ('百度网盘', '夸克网盘', 'uc网盘', '阿里网盘', '百度知道', '百度贴吧')'''
+        # ★ 排除名单从 spider_consts 推导（见文件顶部说明）。
+        #   凡是在 PLATFORM_DOMAINS 注册了域名的分类（网盘 / 知道 / 贴吧 / 暂未开通）
+        #   + 搜索引擎，都不出现在待抓取页；其余视为一般网站资源，需要抓章节。
+        excluded = list(NO_CHAPTER_CRAWL_CATEGORIES)
+        placeholders = ",".join("?" * len(excluded))
+
+        # ★ 用 COALESCE 兜底，避免 category 为 NULL 时 NOT IN 结果非 True 导致整行漏掉
+        query = f'''SELECT s.id,
+                           COALESCE(b.name, s.book_name) as real_book_name,
+                           s.category,
+                           s.site_url,
+                           s.name,
+                           s.attr,
+                           s.crawl_status,
+                           s.resource_status,
+                           s.complaint_time
+                    FROM sites s
+                    LEFT JOIN books b ON s.book_id = b.id
+                    WHERE COALESCE(s.category, '') NOT IN ({placeholders})'''
+        params = list(excluded)
 
         filter_text = self.status_filter.currentText()
         if filter_text == "仅未抓取":
-            query += " AND (s.crawl_status IS NULL OR s.crawl_status = '') AND (s.resource_status IS NULL OR s.resource_status = '') AND (s.complaint_time IS NULL OR s.complaint_time = '')"
+            query += (" AND (s.crawl_status IS NULL OR s.crawl_status = '')"
+                      " AND (s.resource_status IS NULL OR s.resource_status = '')"
+                      " AND (s.complaint_time IS NULL OR s.complaint_time = '')")
         elif filter_text == "仅已抓取":
             query += " AND s.crawl_status = '已抓取'"
         elif filter_text == "已投诉":
@@ -751,7 +806,7 @@ class SpiderPage(QWidget):
             query += " AND s.resource_status = '已失效'"
 
         query += " ORDER BY s.id DESC"
-        records = cursor.execute(query).fetchall()
+        records = cursor.execute(query, params).fetchall()
         conn.close()
 
         for row_data in records:
@@ -797,7 +852,8 @@ class SpiderPage(QWidget):
     def start_crawl(self):
         # ★ 逻辑层拦截
         if license_mgr.is_expired:
-            QMessageBox.warning(self, "授权已过期", "您的会员已过期，无法使用网页抓取功能。\n请前往【个人中心】查看详情或联系管理员续费。")
+            QMessageBox.warning(self, "授权已过期",
+                                "您的会员已过期，无法使用网页抓取功能。\n请前往【个人中心】查看详情或联系管理员续费。")
             return
 
         rule = self.rule_combo.currentText()
@@ -1023,10 +1079,12 @@ class SpiderPage(QWidget):
                 continue
 
             try:
+                # ★ category 与 target_platform 双写，确保在盗版链接页正常显示分类。
+                #   page_links.refresh_table() 的资源分类列读的就是 target_platform。
                 cursor.execute('''INSERT INTO sites
-                                  (category, site_url, feature_code, book_id, book_name, name, attr, crawl_status)
-                                  VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
-                               (cat, url, code, book_id, book_name, name, attr, '已抓取'))
+                                  (category, target_platform, site_url, feature_code, book_id, book_name, name, attr, crawl_status)
+                                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                               (cat, cat, url, code, book_id, book_name, name, attr, '已抓取'))
                 saved_count += 1
             except sqlite3.IntegrityError:
                 pass

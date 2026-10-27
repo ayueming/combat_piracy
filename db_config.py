@@ -3,10 +3,65 @@ import sqlite3
 import os
 import time
 import re
-from app_paths import get_user_dir
+from contextlib import contextmanager
+from app_paths import get_user_dir, FILE_DB
 
-# 平台ID / 百度ID 的合法字符检查
+# 晋江书号 / 百度ID 的合法字符检查
 _ALNUM_CHECK_SQL = "NOT GLOB '*[^A-Za-z0-9]*'"
+
+# books 表字段定义（init_db 建表 & 迁移重建共用，改一处生效两处）
+BOOKS_COLUMNS_SQL = f"""(
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    platform_id   TEXT CHECK (platform_id IS NULL OR platform_id {_ALNUM_CHECK_SQL}),
+    name          TEXT UNIQUE NOT NULL,
+    pen_name      TEXT,
+    aliases       TEXT,
+    evidence_path TEXT,
+    rights_holder TEXT,
+    baidu_id      TEXT CHECK (baidu_id IS NULL OR baidu_id {_ALNUM_CHECK_SQL})
+)"""
+
+# evidences 表字段定义（新结构建表 & 旧结构迁移共用）
+EVIDENCES_COLUMNS_SQL = """(
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_type TEXT NOT NULL,
+    owner_key  TEXT NOT NULL,
+    ev_type    TEXT,
+    file_path  TEXT,
+    UNIQUE (owner_type, owner_key, ev_type)
+)"""
+
+# ★ 新增：draft_links 表结构（搜索草稿，独立于 sites；归档时才搬进 sites）
+#   故意不加 UNIQUE 约束：重复检测改由显式查询完成，命中后标 CRAWL_STATUS_DUPLICATE，
+#   让用户能在搜索页"已在库"tab 看到"这次抓到多少条是已经存过的"。
+#   字段与 sites 对齐，归档时字段对字段搬过去，无需映射。
+DRAFT_LINKS_COLUMNS_SQL = """(
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id            TEXT,
+    category            TEXT,
+    site_url            TEXT,
+    name                TEXT,
+    body_text           TEXT,
+    source_site         TEXT,
+    attr                TEXT,
+    feature_code        TEXT,
+    complaint_time      TEXT,
+    resource_status     TEXT,
+    book_id             INTEGER,
+    book_name           TEXT,
+    crawl_status        TEXT,
+    source_platform     TEXT DEFAULT '',
+    source_keyword      TEXT DEFAULT '',
+    source_url          TEXT DEFAULT '',
+    fetch_time          TEXT DEFAULT '',
+    target_platform     TEXT DEFAULT '',
+    match_status        TEXT DEFAULT '',
+    domain_matched      INTEGER DEFAULT 0,
+    relevance           REAL DEFAULT 0,
+    relevance_hits      TEXT,
+    duplicate_of_id     INTEGER,
+    duplicate_of_table  TEXT
+)"""
 
 # ★ 全局变量，记住当前是谁在登录
 _current_user_id = None
@@ -28,12 +83,57 @@ def get_db_path():
     """动态获取当前用户的数据库完整路径"""
     if not _current_user_id:
         raise Exception("系统异常：未设置当前登录用户，无法连接数据库。")
-    return os.path.join(get_user_dir(_current_user_id), 'piracy_records.db')
+    return os.path.join(get_user_dir(_current_user_id), FILE_DB)
 
 
 def get_conn():
-    """获取当前用户的数据库连接"""
-    return sqlite3.connect(get_db_path())
+    """获取当前用户的数据库连接。
+
+    - foreign_keys=ON：PRAGMA foreign_keys 是"每连接生效"的，之前只在 init_db
+      设过一次，导致后续所有连接的外键实际都是关闭的（book_keywords 的
+      ON DELETE CASCADE 从未生效）。
+    - timeout=5.0（等价 busy_timeout=5000ms）：给后台线程和 UI 线程争锁时
+      留出等待窗口，避免 database is locked。
+    """
+    conn = sqlite3.connect(get_db_path(), timeout=5.0)
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+@contextmanager
+def db():
+    """统一的连接获取方式：自动 close，异常时 rollback。
+
+    用法：
+        with db() as conn:
+            conn.execute(...)
+            conn.commit()
+    """
+    conn = get_conn()
+    try:
+        yield conn
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.close()
+
+
+def _add_column_if_missing(cursor, table, col_name, col_type):
+    """安全地新增列：只吞"列已存在"，其余 OperationalError 重新抛出。
+
+    ★ A1 修复：原代码 `except sqlite3.OperationalError: pass` 会静默吞掉
+      "database is locked"、"disk I/O error" 等真实故障，导致列没加上却继续
+      跑，直到某处 SELECT 才报错，且离根因很远。
+    """
+    try:
+        cursor.execute(f"ALTER TABLE {table} ADD COLUMN {col_name} {col_type}")
+    except sqlite3.OperationalError as e:
+        if "duplicate column name" not in str(e).lower():
+            raise
 
 
 # ================= 1. DB 层格式约束：检测 / 清洗 / 迁移 =================
@@ -74,7 +174,7 @@ def _log_migration(records):
     log_path = os.path.join(log_dir, f"db_migrate_{ts}.log")
     try:
         with open(log_path, "w", encoding="utf-8") as f:
-            f.write("以下记录因【平台ID / 百度ID】包含非字母数字字符，已被置为 NULL：\n")
+            f.write("以下记录因【晋江书号 / 百度ID】包含非字母数字字符，已被置为 NULL：\n")
             f.write("如需保留，请手工修正后重新填写。\n\n")
             for r in records:
                 f.write(f"  id={r['id']}  作品={r['name']}  字段={r['field']}  原值={r['value']!r}\n")
@@ -84,46 +184,60 @@ def _log_migration(records):
 
 
 def _migrate_books_add_check(conn, cursor):
+    """重建 books 表以加 CHECK 约束。
+
+    ★ A2 修复：原实现四步 DDL（CREATE / INSERT / DROP / RENAME）不在事务里，
+      中途失败会留下"books 已被 DROP、books_new 存在"的半迁移状态，下次启动
+      `CREATE TABLE IF NOT EXISTS books` 会建空表，用户数据"看似丢失"。
+
+      这里临时切到 isolation_level=None（autocommit），用显式 BEGIN/COMMIT
+      把四步包成一个原子操作。SQLite 的 DDL 在默认 isolation_level 下会
+      隐式提交，只有 autocommit + BEGIN 才能真正事务化。
+    """
     bad_records = _clean_invalid_book_ids(cursor)
     conn.commit()
-    conn.execute("PRAGMA foreign_keys=OFF")
+
+    old_isolation = conn.isolation_level
+    conn.isolation_level = None  # 切到 autocommit，手动控制事务
     try:
-        cursor.execute(f'''
-            CREATE TABLE books_new
-            (
-                id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                platform_id   TEXT CHECK (platform_id IS NULL OR platform_id {_ALNUM_CHECK_SQL}),
-                name          TEXT UNIQUE NOT NULL,
-                pen_name      TEXT,
-                aliases       TEXT,
-                evidence_path TEXT,
-                rights_holder TEXT,
-                baidu_id      TEXT CHECK (baidu_id IS NULL OR baidu_id {_ALNUM_CHECK_SQL})
-            )
-        ''')
-        cursor.execute('''
-                       INSERT INTO books_new
-                       (id, platform_id, name, pen_name, aliases, evidence_path, rights_holder, baidu_id)
-                       SELECT id,
-                              platform_id,
-                              name,
-                              pen_name,
-                              aliases,
-                              evidence_path,
-                              rights_holder,
-                              baidu_id
-                       FROM books
-                       ''')
-        cursor.execute("DROP TABLE books")
-        cursor.execute("ALTER TABLE books_new RENAME TO books")
-        conn.commit()
+        # PRAGMA foreign_keys 必须在事务外设置
+        conn.execute("PRAGMA foreign_keys=OFF")
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                cursor.execute(f"CREATE TABLE books_new {BOOKS_COLUMNS_SQL}")
+                cursor.execute('''
+                               INSERT INTO books_new
+                               (id, platform_id, name, pen_name, aliases, evidence_path, rights_holder, baidu_id)
+                               SELECT id,
+                                      platform_id,
+                                      name,
+                                      pen_name,
+                                      aliases,
+                                      evidence_path,
+                                      rights_holder,
+                                      baidu_id
+                               FROM books
+                               ''')
+                cursor.execute("DROP TABLE books")
+                cursor.execute("ALTER TABLE books_new RENAME TO books")
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        finally:
+            conn.execute("PRAGMA foreign_keys=ON")
         print("[DB迁移] books 表已重建，platform_id / baidu_id 已加 CHECK 约束")
     finally:
-        conn.execute("PRAGMA foreign_keys=ON")
+        conn.isolation_level = old_isolation
+
     _log_migration(bad_records)
 
 
-# ================= 2. 关键词字典自动生成 =================
+# ================= 2. 关键词字典自动生成 [spider - 暂停] =================
+# ★ 状态：搜索/爬虫功能未落地，book_keywords 当前只写不读。
+# ★ 遗留 B1：改名/删别名后旧关键词不会被清理，搜索功能落地前需修复。
+# ★ 连同 search_logs 表、spider_queries.py 一起评估重启或废弃。
 def _sync_book_keywords(conn, cursor):
     """扫描 books 表，自动拆分曾用名，将词条同步到 book_keywords 字典表"""
     cursor.execute('''
@@ -185,7 +299,9 @@ def _sync_book_keywords(conn, cursor):
     conn.commit()
 
 
-# ================= 3. 网站处理规则初始化 =================
+# ================= 3. 网站处理规则初始化 [spider - 暂停] =================
+# ★ 状态：爬虫功能暂停，site_rules 当前无读取方（spider_queries.get_site_rules_dict 无调用）。
+# ★ 遗留 B3：`jjwxc` 缺 `.com`，重启时需确认爬虫是精确匹配还是子串匹配。
 def _init_site_rules(conn, cursor):
     """初始化网站规则表，并写入默认白名单"""
     cursor.execute('''
@@ -215,7 +331,7 @@ def _init_site_rules(conn, cursor):
     if count == 0:
         default_rules = [
             # 策略代码: ignore(跳过), netdisk(提取网盘), deep_crawl(深挖)
-            ("jjwxc", "白名单", "ignore", "晋江正版，直接跳过"),
+            ("jjwxc", "白名单", "ignore", "晋江正版，直接跳过"),  # [spider-遗留] 缺 .com，重启时确认匹配逻辑
             ("qidian.com", "白名单", "ignore", "起点正版，直接跳过"),
             ("zongheng.com", "白名单", "ignore", "纵横正版，直接跳过"),
             ("pan.baidu.com", "网盘", "netdisk", "百度网盘直链"),
@@ -231,169 +347,126 @@ def _init_site_rules(conn, cursor):
     conn.commit()
 
 
-# ================= 4. 业务接口：供 UI 和 爬虫 层调用 =================
-def record_search_log(book_id, keyword, keyword_type):
-    """前端点击检索时调用，记录搜索行为"""
-    conn = get_conn()
-    cursor = conn.cursor()
-    try:
-        cursor.execute(
-            "INSERT INTO search_logs (book_id, search_keyword, keyword_type) VALUES (?, ?, ?)",
-            (book_id, keyword, keyword_type)
-        )
-        conn.commit()
-    except Exception as e:
-        print(f"记录搜索日志失败: {e}")
-    finally:
-        conn.close()
-
-
-def get_recent_book_frequencies(days=7):
-    """获取近 N 天内，每本书被搜索的频次"""
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute(f'''
-        SELECT book_id, COUNT(*) as freq 
-        FROM search_logs 
-        WHERE search_time >= datetime('now', '-{days} days') 
-        GROUP BY book_id
-    ''')
-    results = cursor.fetchall()
-    conn.close()
-    return {row[0]: row[1] for row in results}
-
-
-def get_site_rules_dict():
-    """获取爬虫调度所需的规则字典 {域名: 策略}"""
-    conn = get_conn()
-    cursor = conn.cursor()
-    try:
-        cursor.execute("SELECT domain, strategy FROM site_rules")
-        rules = {row[0]: row[1] for row in cursor.fetchall()}
-    except Exception:
-        rules = {}
-    finally:
-        conn.close()
-    return rules
-
-
-# ================= 5. 初始化主入口 =================
+# ================= 4. 初始化主入口 =================
 def init_db():
     """初始化当前用户的数据库"""
     if not _current_user_id:
         raise Exception("系统异常：未设置当前用户，无法初始化数据库。")
 
-    conn = get_conn()
-    # 开启外键约束
-    conn.execute("PRAGMA foreign_keys=ON")
-    cursor = conn.cursor()
+    with db() as conn:
+        # WAL 模式：持久化设置，读写可以并发，避免后台线程与 UI 撞锁。
+        # ★ A3：显式 synchronous=NORMAL，避免不同 SQLite 版本默认值不一致。
+        #   WAL 下 NORMAL 是安全且推荐的（不丢已提交事务）。
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
 
-    # 1. 初始化 books 表
-    cursor.execute(f'''CREATE TABLE IF NOT EXISTS books
-                       (
-                           id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                           platform_id   TEXT CHECK (platform_id IS NULL OR platform_id {_ALNUM_CHECK_SQL}),
-                           name          TEXT UNIQUE NOT NULL,
-                           pen_name      TEXT,
-                           aliases       TEXT,
-                           evidence_path TEXT,
-                           rights_holder TEXT,
-                           baidu_id      TEXT CHECK (baidu_id IS NULL OR baidu_id {_ALNUM_CHECK_SQL})
-                       )''')
+        cursor = conn.cursor()
 
-    book_columns_to_add = [("evidence_path", "TEXT"), ("rights_holder", "TEXT"), ("baidu_id", "TEXT")]
-    for col_name, col_type in book_columns_to_add:
-        try:
-            cursor.execute(f"ALTER TABLE books ADD COLUMN {col_name} {col_type}")
-        except sqlite3.OperationalError:
-            pass
-    conn.commit()
+        # 1. 初始化 books 表
+        cursor.execute(f"CREATE TABLE IF NOT EXISTS books {BOOKS_COLUMNS_SQL}")
 
-    if not _books_has_alnum_check(cursor):
-        _migrate_books_add_check(conn, cursor)
+        book_columns_to_add = [("evidence_path", "TEXT"), ("rights_holder", "TEXT"), ("baidu_id", "TEXT")]
+        for col_name, col_type in book_columns_to_add:
+            _add_column_if_missing(cursor, "books", col_name, col_type)
+        conn.commit()
 
-    # 2. 初始化 sites 表
-    cursor.execute('''CREATE TABLE IF NOT EXISTS sites
-                      (
-                          id
-                          INTEGER
-                          PRIMARY
-                          KEY
-                          AUTOINCREMENT,
-                          category
-                          TEXT,
-                          site_url
-                          TEXT
-                          UNIQUE,
-                          name
-                          TEXT,
-                          attr
-                          TEXT,
-                          feature_code
-                          TEXT,
-                          complaint_time
-                          TEXT,
-                          resource_status
-                          TEXT,
-                          book_id
-                          INTEGER,
-                          book_name
-                          TEXT,
-                          crawl_status
-                          TEXT
-                      )''')
+        if not _books_has_alnum_check(cursor):
+            _migrate_books_add_check(conn, cursor)
 
-    site_columns_to_add = [
-        ("name", "TEXT"), ("attr", "TEXT"), ("feature_code", "TEXT"),
-        ("complaint_time", "TEXT"), ("resource_status", "TEXT"),
-        ("book_id", "INTEGER"), ("book_name", "TEXT"), ("crawl_status", "TEXT"),
-    ]
-    for col_name, col_type in site_columns_to_add:
-        try:
-            cursor.execute(f"ALTER TABLE sites ADD COLUMN {col_name} {col_type}")
-        except sqlite3.OperationalError:
-            pass
+        # 2. 初始化 sites 表
+        cursor.execute('''CREATE TABLE IF NOT EXISTS sites
+                          (
+                              id
+                              INTEGER
+                              PRIMARY
+                              KEY
+                              AUTOINCREMENT,
+                              category
+                              TEXT,
+                              site_url
+                              TEXT
+                              UNIQUE,
+                              name
+                              TEXT,
+                              attr
+                              TEXT,
+                              feature_code
+                              TEXT,
+                              complaint_time
+                              TEXT,
+                              resource_status
+                              TEXT,
+                              book_id
+                              INTEGER,
+                              book_name
+                              TEXT,
+                              crawl_status
+                              TEXT
+                          )''')
 
-    # 3. 初始化 records 表
-    cursor.execute(
-        '''CREATE TABLE IF NOT EXISTS records
-           (
-               id
-               INTEGER
-               PRIMARY
-               KEY
-               AUTOINCREMENT,
-               date
-               TEXT,
-               attr
-               TEXT,
-               platform_id
-               TEXT,
-               book_name
-               TEXT,
-               url
-               TEXT
-               UNIQUE
-           )''')
+        site_columns_to_add = [
+            ("name", "TEXT"), ("attr", "TEXT"), ("feature_code", "TEXT"),
+            ("complaint_time", "TEXT"), ("resource_status", "TEXT"),
+            ("book_id", "INTEGER"), ("book_name", "TEXT"), ("crawl_status", "TEXT"),
+            # ★ 抓取溯源三列（拾取入库时写入）
+            ("source_platform", "TEXT DEFAULT ''"),
+            ("source_keyword", "TEXT DEFAULT ''"),
+            ("source_url", "TEXT DEFAULT ''"),
+            # ★ 新增：抓取时间、目标平台、匹配状态
+            ("fetch_time", "TEXT DEFAULT ''"),
+            ("target_platform", "TEXT DEFAULT ''"),
+            ("match_status", "TEXT DEFAULT ''")
+        ]
+        for col_name, col_type in site_columns_to_add:
+            _add_column_if_missing(cursor, "sites", col_name, col_type)
 
-    # 4. 初始化 evidences 表
-    ev_exists = cursor.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='evidences'"
-    ).fetchone()
+        # ★ 新增：2.5 初始化 draft_links 表（搜索草稿，独立于 sites）
+        #   全新库时一次性建出来；老库如果已建过，IF NOT EXISTS 幂等跳过。
+        cursor.execute(f"CREATE TABLE IF NOT EXISTS draft_links {DRAFT_LINKS_COLUMNS_SQL}")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_draft_links_batch   ON draft_links(batch_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_draft_links_status  ON draft_links(crawl_status)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_draft_links_feature ON draft_links(feature_code)")
+        conn.commit()
 
-    if ev_exists:
-        cols = [r[1] for r in cursor.execute("PRAGMA table_info(evidences)").fetchall()]
-        if "book_id" in cols and "owner_type" not in cols:
-            cursor.execute("ALTER TABLE evidences RENAME TO evidences_old")
-            cursor.execute('''CREATE TABLE evidences
-                              (
-                                  id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                                  owner_type TEXT NOT NULL,
-                                  owner_key  TEXT NOT NULL,
-                                  ev_type    TEXT,
-                                  file_path  TEXT,
-                                  UNIQUE (owner_type, owner_key, ev_type)
-                              )''')
+        # 3. 初始化 records 表
+        cursor.execute(
+            '''CREATE TABLE IF NOT EXISTS records
+               (
+                   id
+                   INTEGER
+                   PRIMARY
+                   KEY
+                   AUTOINCREMENT,
+                   date
+                   TEXT,
+                   attr
+                   TEXT,
+                   platform_id
+                   TEXT,
+                   book_name
+                   TEXT,
+                   url
+                   TEXT
+                   UNIQUE
+               )''')
+
+        # 4. 初始化 evidences 表（旧结构迁移 + 新结构建表，合并为一段逻辑）
+        ev_exists = cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='evidences'"
+        ).fetchone()
+
+        need_migration = False
+        if ev_exists:
+            cols = [r[1] for r in cursor.execute("PRAGMA table_info(evidences)").fetchall()]
+            if "book_id" in cols and "owner_type" not in cols:
+                cursor.execute("ALTER TABLE evidences RENAME TO evidences_old")
+                need_migration = True
+
+        # 建新结构（幂等，只有一处 CREATE）
+        cursor.execute(f"CREATE TABLE IF NOT EXISTS evidences {EVIDENCES_COLUMNS_SQL}")
+
+        # 迁移旧数据
+        if need_migration:
             for b_id, ev_type, f_path in cursor.execute(
                     "SELECT book_id, ev_type, file_path FROM evidences_old"
             ).fetchall():
@@ -407,58 +480,31 @@ def init_db():
                         "VALUES ('book', ?, ?, ?)", (str(b_id), ev_type, f_path))
             cursor.execute("DROP TABLE evidences_old")
 
-    cursor.execute('''CREATE TABLE IF NOT EXISTS evidences
-    (
-        id
-        INTEGER
-        PRIMARY
-        KEY
-        AUTOINCREMENT,
-        owner_type
-        TEXT
-        NOT
-        NULL,
-        owner_key
-        TEXT
-        NOT
-        NULL,
-        ev_type
-        TEXT,
-        file_path
-        TEXT,
-        UNIQUE
-                      (
-        owner_type,
-        owner_key,
-        ev_type
-                      )
-        )''')
+        # 5. 初始化 search_logs 表 [spider - 暂停]
+        # ★ 状态：record_search_log / get_recent_book_frequencies 均无调用方。
+        cursor.execute('''CREATE TABLE IF NOT EXISTS search_logs
+                          (
+                              id
+                              INTEGER
+                              PRIMARY
+                              KEY
+                              AUTOINCREMENT,
+                              book_id
+                              INTEGER,
+                              search_keyword
+                              TEXT,
+                              keyword_type
+                              TEXT,
+                              search_time
+                              TIMESTAMP
+                              DEFAULT
+                              CURRENT_TIMESTAMP
+                          )''')
 
-    # 5. 初始化 search_logs 表（记录搜索频率）
-    cursor.execute('''CREATE TABLE IF NOT EXISTS search_logs
-                      (
-                          id
-                          INTEGER
-                          PRIMARY
-                          KEY
-                          AUTOINCREMENT,
-                          book_id
-                          INTEGER,
-                          search_keyword
-                          TEXT,
-                          keyword_type
-                          TEXT,
-                          search_time
-                          TIMESTAMP
-                          DEFAULT
-                          CURRENT_TIMESTAMP
-                      )''')
+        # 6. 自动构建专属关键词字典表 [spider - 暂停]
+        _sync_book_keywords(conn, cursor)
 
-    # 6. 自动构建专属关键词字典表
-    _sync_book_keywords(conn, cursor)
+        # 7. 初始化网站处理规则表 [spider - 暂停]
+        _init_site_rules(conn, cursor)
 
-    # 7. 初始化网站处理规则表
-    _init_site_rules(conn, cursor)
-
-    conn.commit()
-    conn.close()
+        conn.commit()

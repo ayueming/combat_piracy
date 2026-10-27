@@ -2,7 +2,7 @@
 import os
 import json
 from datetime import datetime, timezone, timedelta
-from app_paths import get_user_dir
+from app_paths import get_user_dir, FILE_AUTH
 from db_config import get_current_user
 
 
@@ -36,7 +36,7 @@ class LicenseManager:
             self._days_left = 0
             return
 
-        auth_file = os.path.join(get_user_dir(user_id), "auth.json")
+        auth_file = os.path.join(get_user_dir(user_id), FILE_AUTH)
 
         if not os.path.exists(auth_file):
             self._is_expired = True

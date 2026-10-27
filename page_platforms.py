@@ -49,6 +49,7 @@ class PlatformCard(QFrame):
 
         url_label = QLabel(f"🔗 {url}")
         url_label.setStyleSheet("font-size: 11px; color: #999; border: none;")
+        url_label.setWordWrap(True) # ★ 防止长网址撑爆卡片
         layout.addWidget(url_label)
 
         self.btn = QPushButton("🌐 打开投诉后台")
@@ -79,8 +80,6 @@ class PlatformCard(QFrame):
 
     def open_browser(self):
         try:
-            # ★ 直接在主线程调用单例。
-            # 因为 new_page 内部设置了极速返回（15秒超时放行），所以不用担心卡界面。
             bm = BrowserManager.instance()
             bm.new_page(self.url)
         except Exception as e:
@@ -107,7 +106,7 @@ class PlatformsPage(QWidget):
         layout.addWidget(title)
 
         tip = QLabel(
-            "点击下方任意卡片，将在统一浏览器中打开平台后台（无需重新登录）。")
+            "点击下方任意卡片，将在统一浏览器中打开平台后台。")
         tip.setStyleSheet("font-size: 14px; color: #666; margin-bottom: 20px;")
         layout.addWidget(tip)
 

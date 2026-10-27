@@ -7,8 +7,24 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushB
                                QMessageBox, QInputDialog, QTextBrowser, QTabWidget, QApplication)
 from PySide6.QtCore import Qt
 
-from app_paths import APP_DIR, get_session_path, get_user_dir
+from app_paths import APP_DIR, get_session_path, get_user_dir, FILE_AUTH
 from db_config import get_current_user
+
+# ★ 统一引入样式
+from ui_styles import (
+    BTN_DANGER,
+    BTN_SECONDARY_DARK,
+    TAB_WIDGET,
+    PRIMARY_GREEN,
+    DANGER_RED,
+    TEXT_ORANGE,
+    TEXT_DARK,
+    TEXT_GRAY,
+    BG_WHITE,
+    BG_HOVER,
+    BORDER_GRAY,
+    BORDER_SOFT,
+)
 
 
 class ProfilePage(QWidget):
@@ -27,36 +43,8 @@ class ProfilePage(QWidget):
         layout.setSpacing(0)
 
         self.tabs = QTabWidget()
-        # 书签样式
-        self.tabs.setStyleSheet("""
-            QTabWidget::pane { 
-                border: 1px solid #E5E7EB; 
-                background-color: #FFFFFF;
-                border-radius: 0px 6px 6px 6px;
-                top: -1px; 
-            }
-            QTabBar::tab { 
-                background: #F3F4F6; 
-                color: #6B7280;
-                padding: 8px 24px; 
-                font-size: 14px;
-                border: 1px solid #E5E7EB;
-                border-bottom: none;
-                border-top-left-radius: 6px;
-                border-top-right-radius: 6px;
-                margin-right: 4px;
-            }
-            QTabBar::tab:selected { 
-                background: #FFFFFF; 
-                color: #1F2937; 
-                font-weight: bold; 
-                border: 1px solid #E5E7EB;
-                border-bottom: 1px solid #FFFFFF;
-            }
-            QTabBar::tab:hover:!selected { 
-                color: #059669; 
-            }
-        """)
+        # ★ 直接使用全局统一的 TabWidget 样式
+        self.tabs.setStyleSheet(TAB_WIDGET)
 
         self.tabs.addTab(self._create_account_tab(), "个人中心")
         self.tabs.addTab(self._create_help_tab(), "使用帮助")
@@ -79,36 +67,37 @@ class ProfilePage(QWidget):
 
             lbl = QLabel(label_text)
             lbl.setFixedWidth(80)
-            lbl.setStyleSheet("font-size: 15px; color: #4B5563; font-weight: 500;")
+            # ★ 统一文字颜色
+            lbl.setStyleSheet(f"font-size: 15px; color: {TEXT_GRAY}; font-weight: 500;")
 
             row.addWidget(lbl)
             row.addWidget(value_widget)
             row.addStretch()
             return row_widget
 
-        # 统一的圆滑小按钮样式
-        btn_small_style = """
-            QPushButton {
-                border: 1px solid #D1D5DB; 
+        # ★ 统一的小圆角按钮样式（基础结构保留，颜色从 ui_styles 引入）
+        btn_small_style = f"""
+            QPushButton {{
+                border: 1px solid {BORDER_GRAY}; 
                 border-radius: 11px;
                 padding: 0px 10px;
                 font-size: 12px;
-                color: #6B7280;
-                background: #FFFFFF;
-            }
-            QPushButton:hover { 
-                background: #F9FAFB; 
-                color: #059669; 
-                border-color: #059669;
-            }
-            QPushButton:pressed {
-                background: #F3F4F6;
-            }
+                color: {TEXT_GRAY};
+                background: {BG_WHITE};
+            }}
+            QPushButton:hover {{ 
+                background: {BG_HOVER}; 
+                color: {PRIMARY_GREEN}; 
+                border-color: {PRIMARY_GREEN};
+            }}
+            QPushButton:pressed {{
+                background: {BORDER_SOFT};
+            }}
         """
 
         # --- 行1：昵称 ---
         self.lbl_nickname = QLabel()
-        self.lbl_nickname.setStyleSheet("font-size: 16px; font-weight: bold; color: #1F2937;")
+        self.lbl_nickname.setStyleSheet(f"font-size: 16px; font-weight: bold; color: {TEXT_DARK};")
 
         self.btn_rename = QPushButton("修改")
         self.btn_rename.setCursor(Qt.PointingHandCursor)
@@ -127,17 +116,17 @@ class ProfilePage(QWidget):
 
         # --- 行2：登录账号 ---
         self.lbl_email = QLabel()
-        self.lbl_email.setStyleSheet("font-size: 16px; font-weight: bold; color: #1F2937;")
+        self.lbl_email.setStyleSheet(f"font-size: 16px; font-weight: bold; color: {TEXT_DARK};")
         layout.addWidget(create_row("登录账号", self.lbl_email))
 
         # --- 行3：授权状况 ---
         self.lbl_vip = QLabel()
-        self.lbl_vip.setStyleSheet("font-size: 16px; font-weight: bold; color: #1F2937;")
+        self.lbl_vip.setStyleSheet(f"font-size: 16px; font-weight: bold; color: {TEXT_DARK};")
         layout.addWidget(create_row("授权状况", self.lbl_vip))
 
         # --- 行4：用户ID ---
         self.lbl_user_id = QLabel()
-        self.lbl_user_id.setStyleSheet("font-size: 16px; font-weight: bold; color: #1F2937;")
+        self.lbl_user_id.setStyleSheet(f"font-size: 16px; font-weight: bold; color: {TEXT_DARK};")
 
         self.btn_copy_id = QPushButton("复制")
         self.btn_copy_id.setCursor(Qt.PointingHandCursor)
@@ -156,21 +145,15 @@ class ProfilePage(QWidget):
 
         # --- 行5：注册日期 ---
         self.lbl_created_at = QLabel()
-        self.lbl_created_at.setStyleSheet("font-size: 16px; font-weight: bold; color: #1F2937;")
+        self.lbl_created_at.setStyleSheet(f"font-size: 16px; font-weight: bold; color: {TEXT_DARK};")
         layout.addWidget(create_row("注册日期", self.lbl_created_at))
 
         # --- 行6：操作（退出登录） ---
         self.btn_logout = QPushButton("退出登录")
         self.btn_logout.setCursor(Qt.PointingHandCursor)
         self.btn_logout.setFixedSize(100, 32)
-        self.btn_logout.setStyleSheet("""
-            QPushButton {
-                background-color: #F87171; color: white; 
-                border-radius: 6px; font-size: 13px; font-weight: bold;
-                border: none;
-            }
-            QPushButton:hover { background-color: #EF4444; }
-        """)
+        # ★ 直接使用全局统一的危险操作按钮样式
+        self.btn_logout.setStyleSheet(BTN_DANGER)
         self.btn_logout.clicked.connect(self.on_logout_clicked)
         layout.addWidget(create_row("操作", self.btn_logout))
 
@@ -181,12 +164,13 @@ class ProfilePage(QWidget):
     def _create_help_tab(self):
         browser = QTextBrowser()
         browser.setOpenExternalLinks(True)
-        browser.setStyleSheet("""
-            QTextBrowser { border: none; background-color: #FFFFFF;
-                           padding: 20px; font-size: 14px; color: #333333; }
+        # ★ 统一文字和背景色
+        browser.setStyleSheet(f"""
+            QTextBrowser {{ border: none; background-color: {BG_WHITE};
+                           padding: 20px; font-size: 14px; color: {TEXT_DARK}; }}
         """)
 
-        # ★ 修复寻址逻辑：优先读取外部（支持热更新），找不到再去内部（_MEIPASS 指向 _internal）
+        # 修复寻址逻辑：优先读取外部（支持热更新），找不到再去内部（_MEIPASS 指向 _internal）
         if getattr(sys, 'frozen', False):
             exe_dir = os.path.dirname(sys.executable)
         else:
@@ -220,7 +204,8 @@ class ProfilePage(QWidget):
             self.lbl_nickname.setText("开发者")
             self.lbl_email.setText("本地模式")
             self.lbl_vip.setText("无限制")
-            self.lbl_vip.setStyleSheet("font-size: 16px; font-weight: bold; color: #10B981;")
+            # ★ 统一使用主绿色
+            self.lbl_vip.setStyleSheet(f"font-size: 16px; font-weight: bold; color: {PRIMARY_GREEN};")
             self.lbl_user_id.setText("DEV-MODE-0000")
             self.lbl_created_at.setText(datetime.now().strftime("%Y-%m-%d"))
             self.btn_rename.setEnabled(False)
@@ -232,7 +217,7 @@ class ProfilePage(QWidget):
             self.lbl_nickname.setText("未登录")
             self.lbl_email.setText("-")
             self.lbl_vip.setText("-")
-            self.lbl_vip.setStyleSheet("font-size: 16px; font-weight: bold; color: #1F2937;")
+            self.lbl_vip.setStyleSheet(f"font-size: 16px; font-weight: bold; color: {TEXT_DARK};")
             self.lbl_user_id.setText("-")
             self.lbl_created_at.setText("-")
             self.btn_rename.setEnabled(False)
@@ -240,7 +225,7 @@ class ProfilePage(QWidget):
             self.btn_logout.setVisible(False)
             return
 
-        auth_file = os.path.join(get_user_dir(user_id), "auth.json")
+        auth_file = os.path.join(get_user_dir(user_id), FILE_AUTH)
 
         if not os.path.exists(auth_file):
             self.lbl_nickname.setText("数据缺失")
@@ -292,7 +277,8 @@ class ProfilePage(QWidget):
         expires_at_str = info.get("expires_at")
         if not expires_at_str:
             self.lbl_vip.setText("永久有效")
-            self.lbl_vip.setStyleSheet("font-size: 16px; font-weight: bold; color: #10B981;")
+            # ★ 统一主绿色
+            self.lbl_vip.setStyleSheet(f"font-size: 16px; font-weight: bold; color: {PRIMARY_GREEN};")
         else:
             try:
                 utc_time = datetime.fromisoformat(expires_at_str.replace("Z", "+00:00"))
@@ -305,16 +291,19 @@ class ProfilePage(QWidget):
 
                 if days_left < 0:
                     self.lbl_vip.setText(f"已过期（{expire_date_str}）")
-                    self.lbl_vip.setStyleSheet("font-size: 16px; font-weight: bold; color: #E74C3C;")
+                    # ★ 统一危险红
+                    self.lbl_vip.setStyleSheet(f"font-size: 16px; font-weight: bold; color: {DANGER_RED};")
                 elif days_left <= 7:
                     self.lbl_vip.setText(f"即将过期（剩 {days_left} 天，{expire_date_str} 到期）")
-                    self.lbl_vip.setStyleSheet("font-size: 16px; font-weight: bold; color: #E67E22;")
+                    # ★ 统一警告橙
+                    self.lbl_vip.setStyleSheet(f"font-size: 16px; font-weight: bold; color: {TEXT_ORANGE};")
                 else:
                     self.lbl_vip.setText(f"正常（{expire_date_str} 到期）")
-                    self.lbl_vip.setStyleSheet("font-size: 16px; font-weight: bold; color: #10B981;")
+                    # ★ 统一主绿色
+                    self.lbl_vip.setStyleSheet(f"font-size: 16px; font-weight: bold; color: {PRIMARY_GREEN};")
             except Exception:
                 self.lbl_vip.setText("未知")
-                self.lbl_vip.setStyleSheet("font-size: 16px; font-weight: bold; color: #6B7280;")
+                self.lbl_vip.setStyleSheet(f"font-size: 16px; font-weight: bold; color: {TEXT_GRAY};")
 
     def on_copy_id_clicked(self):
         if self._auth_info:
@@ -393,7 +382,7 @@ class ProfilePage(QWidget):
 
             if update_resp.status_code == 200:
                 info["nickname"] = new_name
-                auth_file = os.path.join(get_user_dir(user_id), "auth.json")
+                auth_file = os.path.join(get_user_dir(user_id), FILE_AUTH)
                 with open(auth_file, "w", encoding="utf-8") as f:
                     json.dump(info, f)
 

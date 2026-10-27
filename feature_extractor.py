@@ -1,28 +1,31 @@
+# feature_extractor.py
 import re
-
+from app_data import DOMAIN_RULES, FEATURE_PATTERNS, ALL_SUB_PLATFORMS
 
 def get_platform_category(url):
     """
     根据链接自动识别平台分类。
-    识别不到则返回空字符串。
+    返回匹配到的标准显示名（必须存在于 ALL_SUB_PLATFORMS 中），识别不到返回空字符串。
     """
-    url = url.lower()
+    if not url:
+        return ""
 
-    if "pan.baidu.com" in url:
-        return "百度网盘"
-    elif "zhidao.baidu.com" in url:
-        return "百度知道"
-    elif "tieba.baidu.com" in url:
-        return "百度贴吧"
-    elif "pan.quark.cn" in url:
-        return "夸克网盘"
-    elif "drive.uc.cn" in url:
-        return "uc网盘"
-    elif "aliyundrive.com" in url or "alipan.com" in url:
-        return "阿里网盘"  # 如果你之后加了这个按钮
-    elif "baidu.com" in url:
+    url_lower = url.lower()
+
+    # 1. 优先匹配具体域名（如网盘直链）
+    for domain, cat_name in DOMAIN_RULES:
+        if domain in url_lower:
+            # ★ 核心防御：只有当该分类存在于当前系统配置中时才返回
+            if cat_name in ALL_SUB_PLATFORMS:
+                return cat_name
+            return ""
+
+    # 2. 兜底：如果是普通的 baidu.com 链接，识别为百度搜索
+    if "baidu.com" in url_lower and "百度搜索" in ALL_SUB_PLATFORMS:
         return "百度搜索"
-    elif "quark.cn" in url:
+
+    # 3. 兜底：如果是普通的 quark.cn 链接，识别为夸克搜索
+    if "quark.cn" in url_lower and "夸克搜索" in ALL_SUB_PLATFORMS:
         return "夸克搜索"
 
     return ""
@@ -41,28 +44,18 @@ def extract_pure_feature(url):
 
     code = ""
 
-    baidu_match = re.search(r'(?:pan\.baidu\.com/s/|surl=)([a-zA-Z0-9_-]+)', url)
-    if baidu_match:
-        code = baidu_match.group(1)
-    else:
-        quark_match = re.search(r'pan\.quark\.cn/s/([a-zA-Z0-9]+)', url)
-        if quark_match:
-            code = quark_match.group(1)
-        else:
-            zhidao_match = re.search(r'zhidao\.baidu\.com/question/(\d+)', url)
-            if zhidao_match:
-                code = zhidao_match.group(1)
-            else:
-                tieba_match = re.search(r'tieba\.baidu\.com/p/(\d+)', url)
-                if tieba_match:
-                    code = tieba_match.group(1)
-                else:
-                    uc_match = re.search(r'drive\.uc\.cn/s/([a-zA-Z0-9]+)', url)
-                    if uc_match:
-                        code = uc_match.group(1)
-                    else:
-                        code = url
+    # ★ 循环遍历正则列表进行匹配
+    for pattern in FEATURE_PATTERNS:
+        match = re.search(pattern, url)
+        if match:
+            code = match.group(1)
+            break
 
+    # 如果没匹配到具体的规则，就把整个 url 作为特征码
+    if not code:
+        code = url
+
+    # 去除开头可能误带的 '1'
     if code.startswith('1') and len(code) >= 20:
         code = code[1:]
 

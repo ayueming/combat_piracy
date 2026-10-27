@@ -11,82 +11,40 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushB
 from PySide6.QtCore import Qt, QSettings, QUrl
 from PySide6.QtGui import QDesktopServices, QColor, QPainter
 from db_config import get_conn, get_current_user
-from ui_components import CenteredCheckBoxDelegate
-from app_paths import get_user_dir
 
+# ★ 4.2：IdDelegate 泛化为 PatternCellDelegate + is_alnum_only
+from ui_components import (
+    CenteredCheckBoxDelegate,
+    ElidedLabel,
+    PatternCellDelegate,
+    is_alnum_only,
+    HintButton,
+)
+from app_paths import get_user_dir, get_user_subdir, DIR_EVIDENCES
 
-class ElidedLabel(QLabel):
-    def __init__(self, text="", parent=None):
-        super().__init__(parent)
-        self._full_text = text
-        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-        self.setMinimumWidth(30)
-        self.setToolTip(text)
-        super().setText(text)
-
-    def setFullText(self, text):
-        self._full_text = text
-        self.setToolTip(text)
-        self._apply_elide()
-
-    def _apply_elide(self):
-        fm = self.fontMetrics()
-        avail = max(self.width() - 2, 0)
-        super().setText(fm.elidedText(self._full_text, Qt.ElideMiddle, avail))
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self._apply_elide()
-
-
-# ================= ID 列专用 delegate：离开单元格立即标红 =================
-class IdDelegate(QStyledItemDelegate):
-    """平台ID / 百度CP号：通过重写 paint 绕过 QSS 限制，实现在选中状态下依然显示红底红字"""
-    INVALID_BG = QColor("#FADBD8")
-    INVALID_BG_SELECTED = QColor("#F4C2C2")  # 选中时稍深的红色
-    INVALID_FG = QColor("#C0392B")
-    BORDER_COLOR = QColor("#E9ECEF")
-    SELECT_BORDER = QColor("#10B981")  # 选中时画个绿边框
-
-    @staticmethod
-    def is_valid(text):
-        """空值允许（可先留空后补），非空必须全是英文字母/数字"""
-        text = (text or "").strip()
-        return (not text) or bool(re.fullmatch(r'[A-Za-z0-9]+', text))
-
-    def paint(self, painter, option, index):
-        text = index.data(Qt.DisplayRole) or ""
-
-        if self.is_valid(text):
-            # 合法：走默认逻辑，享受系统的选中效果
-            super().paint(painter, option, index)
-        else:
-            # 非法：强行接管绘制，无视 QSS 的覆盖
-            painter.save()
-
-            if option.state & QStyle.State_Selected:
-                # 选中状态：画深红底 + 绿边框
-                painter.fillRect(option.rect.adjusted(0, 0, 0, -1), self.INVALID_BG_SELECTED)
-                painter.setPen(self.SELECT_BORDER)
-                painter.drawRect(option.rect.adjusted(0, 0, -1, -1))
-            else:
-                # 未选中：画淡红底
-                painter.fillRect(option.rect.adjusted(0, 0, 0, -1), self.INVALID_BG)
-
-            # 画红字
-            painter.setPen(self.INVALID_FG)
-            painter.drawText(option.rect.adjusted(4, 0, -4, 0), Qt.AlignLeft | Qt.AlignVCenter, text)
-
-            # 补上 QSS 里的底边框
-            painter.setPen(self.BORDER_COLOR)
-            painter.drawLine(option.rect.bottomLeft(), option.rect.bottomRight())
-
-            painter.restore()
-
-    def setModelData(self, editor, model, index):
-        # 编辑器关闭时，直接写回模型，paint 会自动根据内容判断是否标红
-        text = editor.text().strip()
-        model.setData(index, text, Qt.EditRole)
+# ★ 按钮/表格样式统一从 ui_styles 引入
+from ui_styles import (
+    BTN_SECONDARY,
+    BTN_PRIMARY,
+    BTN_PRIMARY_OUTLINE,
+    BTN_DANGER_OUTLINE,
+    BTN_SECONDARY_DARK,
+    TABLE_BASE,
+    btn_link_style,
+    PRIMARY_GREEN,
+    PRIMARY_GREEN_HOVER,
+    TEXT_BLUE,
+    TEXT_BLUE_HOVER,
+    TEXT_ORANGE,
+    TEXT_ORANGE_HOVER,
+    DANGER_RED,
+    DANGER_RED_HOVER,
+    TEXT_NAVY,
+    TEXT_GRAY,
+    TEXT_DARK,
+    BG_HOVER,
+    BORDER_SOFT,
+)
 
 
 class EvidenceWidget(QWidget):
@@ -96,8 +54,9 @@ class EvidenceWidget(QWidget):
         self.parent_page = parent_page
         self.row_index = row_index
 
-        # ★ 修复提示框变黑的 BUG：删除了导致样式继承污染的 transparent 设置
-        # self.setStyleSheet("background-color: transparent;")
+        # ★ 允许宽度压缩，防止 2 个证据卡片把整个窗口撑爆
+        self.setMinimumWidth(200)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(8, 0, 8, 0)
@@ -108,7 +67,7 @@ class EvidenceWidget(QWidget):
             db_id = id_item.data(Qt.UserRole) if id_item else ""
 
             if db_id:
-                self.upload_btn = self._link_button("📎 上传维权书", "#00B87C", "#00996A", bold=True)
+                self.upload_btn = self._link_button("📎 上传维权书", PRIMARY_GREEN, PRIMARY_GREEN_HOVER, bold=True)
                 self.upload_btn.clicked.connect(self.upload_file)
                 layout.addWidget(self.upload_btn)
 
@@ -117,16 +76,16 @@ class EvidenceWidget(QWidget):
             file_name = os.path.basename(self.file_path)
 
             self.name_label = ElidedLabel(f"📄 {file_name}")
-            self.name_label.setStyleSheet("color: #2C3E50; font-size: 12px; background: transparent;")
+            self.name_label.setStyleSheet(f"color: {TEXT_NAVY}; font-size: 12px; background: transparent;")
             layout.addWidget(self.name_label, 1)
 
-            self.preview_btn = self._link_button("预览", "#3B82F6", "#2563EB")
+            self.preview_btn = self._link_button("预览", TEXT_BLUE, TEXT_BLUE_HOVER)
             self.preview_btn.clicked.connect(self.preview_file)
 
-            self.reupload_btn = self._link_button("重新上传", "#E67E22", "#C96A12")
+            self.reupload_btn = self._link_button("重新上传", TEXT_ORANGE, TEXT_ORANGE_HOVER)
             self.reupload_btn.clicked.connect(self.upload_file)
 
-            self.delete_btn = self._link_button("删除", "#E74C3C", "#C0392B")
+            self.delete_btn = self._link_button("删除", DANGER_RED, DANGER_RED_HOVER)
             self.delete_btn.clicked.connect(self.delete_file)
 
             layout.addWidget(self.preview_btn)
@@ -138,23 +97,11 @@ class EvidenceWidget(QWidget):
         btn.setCursor(Qt.PointingHandCursor)
         btn.setFlat(True)
         btn.setFocusPolicy(Qt.NoFocus)
-        btn.setStyleSheet(f"""
-            QPushButton {{
-                color: {color};
-                background: transparent;
-                border: none;
-                padding: 2px 2px;
-                font-size: 12px;
-                {'font-weight: bold;' if bold else ''}
-            }}
-            QPushButton:hover {{
-                color: {hover_color};
-                text-decoration: underline;
-            }}
-            QPushButton:pressed {{
-                color: {hover_color};
-            }}
-        """)
+
+        style = btn_link_style(color, hover_color)
+        if bold:
+            style += " QPushButton { font-weight: bold; }"
+        btn.setStyleSheet(style)
         return btn
 
     def _row(self):
@@ -180,18 +127,13 @@ class EvidenceWidget(QWidget):
                 return
 
             try:
-                # ★ 修改开始：获取当前用户专属目录
                 user_id = get_current_user()
                 if user_id:
-                    data_dir = os.path.join(get_user_dir(user_id), "evidences")
+                    data_dir = get_user_subdir(user_id, DIR_EVIDENCES)
                 else:
-                    # 开发模式未登录时的兜底目录
                     base_dir = os.path.dirname(os.path.abspath(__file__))
                     data_dir = os.path.join(base_dir, "evidences_data")
-
-                if not os.path.exists(data_dir):
-                    os.makedirs(data_dir)
-                # ★ 修改结束
+                    os.makedirs(data_dir, exist_ok=True)
 
                 prefix_id = platform_id if platform_id else f"book_{db_id}"
                 safe_prefix = re.sub(r'[\\/:*?"<>|]', '_', prefix_id)
@@ -227,7 +169,6 @@ class EvidenceWidget(QWidget):
         if shared:
             return
 
-        # ★ 修改：兼容新目录 (evidences) 和旧目录 (evidences_data)
         if "evidences" not in old_path.lower() and "evidences_data" not in old_path.lower():
             return
         try:
@@ -242,7 +183,6 @@ class EvidenceWidget(QWidget):
             QMessageBox.warning(self.window(), "提示", "文件不存在，可能已被移动或删除。")
 
     def delete_file(self):
-        # ★ 修复：将 self 改为 self.window()，避免弹窗继承透明背景导致黑屏
         reply = QMessageBox.question(
             self.window(), "确认",
             "确定要删除这份维权书吗？\n\n（只删除维权书.pdf，相关原始证明图片资料不受影响）",
@@ -279,44 +219,32 @@ class ImportBooksDialog(QDialog):
         layout.setSpacing(15)
 
         group_template = QGroupBox("第一步：下载标准模板")
-        group_template.setStyleSheet("QGroupBox { font-weight: bold; color: #333; }")
+        group_template.setStyleSheet(f"QGroupBox {{ font-weight: bold; color: {TEXT_DARK}; }}")
         layout_template = QVBoxLayout(group_template)
 
         lbl_tip1 = QLabel("为了确保数据能正确导入，请先下载模板，并按照表头格式填写您的作品信息。")
-        lbl_tip1.setStyleSheet("color: #666; font-weight: normal;")
+        lbl_tip1.setStyleSheet(f"color: {TEXT_GRAY}; font-weight: normal;")
         lbl_tip1.setWordWrap(True)
         layout_template.addWidget(lbl_tip1)
 
         btn_download = QPushButton("下载 Excel 模板")
-        btn_download.setStyleSheet("""
-            QPushButton { 
-                padding: 8px; background-color: #F8F9FA; color: #333;
-                border: 1px solid #DCDFE6; border-radius: 4px; font-weight: bold;
-            }
-            QPushButton:hover { background-color: #F0F0F0; border-color: #1F1F1F; }
-        """)
+        btn_download.setStyleSheet(BTN_SECONDARY_DARK + "QPushButton { padding: 8px 12px; }")
         btn_download.clicked.connect(self.download_template)
         layout_template.addWidget(btn_download)
 
         layout.addWidget(group_template)
 
         group_upload = QGroupBox("第二步：上传已填写的文件")
-        group_upload.setStyleSheet("QGroupBox { font-weight: bold; color: #333; }")
+        group_upload.setStyleSheet(f"QGroupBox {{ font-weight: bold; color: {TEXT_DARK}; }}")
         layout_upload = QVBoxLayout(group_upload)
 
         lbl_tip2 = QLabel("请选择填写好的 Excel (.xlsx) 或 CSV (.csv) 文件进行导入。如果作品名已存在，将会自动跳过。")
-        lbl_tip2.setStyleSheet("color: #666; font-weight: normal;")
+        lbl_tip2.setStyleSheet(f"color: {TEXT_GRAY}; font-weight: normal;")
         lbl_tip2.setWordWrap(True)
         layout_upload.addWidget(lbl_tip2)
 
         btn_upload = QPushButton("选择文件并导入")
-        btn_upload.setStyleSheet("""
-            QPushButton { 
-                padding: 8px; background-color: #00B87C; color: white;
-                border: none; border-radius: 4px; font-weight: bold;
-            }
-            QPushButton:hover { background-color: #00996A; }
-        """)
+        btn_upload.setStyleSheet(BTN_PRIMARY + "QPushButton { padding: 8px 12px; }")
         btn_upload.clicked.connect(self.upload_file)
         layout_upload.addWidget(btn_upload)
 
@@ -334,7 +262,7 @@ class ImportBooksDialog(QDialog):
             ws = wb.active
             ws.title = "作品列表"
 
-            headers = ["平台ID(必填)", "作品名(必填)", "作品曾用名", "笔名", "权利人(必填)", "百度CP号(必填)"]
+            headers = ["平台书号(必填)", "作品名(必填)", "作品曾用名", "笔名", "权利人(必填)", "百度CP号(必填)"]
             for col, header in enumerate(headers, 1):
                 ws.cell(row=1, column=col, value=header)
 
@@ -409,7 +337,7 @@ class ImportBooksDialog(QDialog):
             pen_name = str(row[col_idx["pen_name"]]).strip() if len(row) > col_idx["pen_name"] else ""
             rights = str(row[col_idx["rights_holder"]]).strip() if len(row) > col_idx["rights_holder"] else ""
 
-            if not IdDelegate.is_valid(platform_id) or not IdDelegate.is_valid(baidu_id):
+            if not is_alnum_only(platform_id) or not is_alnum_only(baidu_id):
                 invalid_count += 1
                 continue
 
@@ -452,7 +380,7 @@ class BooksPage(QWidget):
 
         title_layout = QHBoxLayout()
         title_label = QLabel("【作品库】")
-        title_label.setStyleSheet("font-size: 20px; font-weight: bold; color: #1F1F1F;")
+        title_label.setStyleSheet(f"font-size: 20px; font-weight: bold; color: {TEXT_DARK};")
         title_layout.addWidget(title_label)
         title_layout.addStretch()
         layout.addLayout(title_layout)
@@ -460,56 +388,29 @@ class BooksPage(QWidget):
         tool_layout = QHBoxLayout()
         tool_layout.setSpacing(10)
 
-        tip_label = QLabel("💡 平台ID/百度CP号 仅支持英文字母和数字，非法会立即标红。")
-        tip_label.setStyleSheet("color: #666;")
-        tip_label.setWordWrap(False)
-        tool_layout.addWidget(tip_label)
+        # ★ 加上防撑爆提示，且允许它收缩
+        hint = HintButton("平台ID/百度CP号 仅支持英文字母和数字，非法会立即标红。")
+        hint.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        tool_layout.addWidget(hint)
         tool_layout.addStretch()
 
-        common_btn_style = """
-            QPushButton { 
-                background-color: #FFFFFF; color: #333333; border: 1px solid #CCCCCC; 
-                border-radius: 4px; padding: 6px 12px;
-            }
-            QPushButton:hover { background-color: #F5F5F5; }
-        """
-
-        # ★ 新增：➕ 新增作品（显式入口）
         add_btn = QPushButton("➕ 新增空白行")
-        add_btn.setStyleSheet("""
-            QPushButton { 
-                background-color: #FFFFFF; color: #00B87C; border: 1px solid #00B87C; 
-                border-radius: 4px; padding: 6px 12px; font-weight: bold;
-            }
-            QPushButton:hover { background-color: #F0FFF8; }
-        """)
+        add_btn.setStyleSheet(BTN_PRIMARY_OUTLINE)
         add_btn.clicked.connect(self.add_new_row)
         tool_layout.addWidget(add_btn)
 
         make_evidence_btn = QPushButton("制作维权书（单选）")
-        make_evidence_btn.setStyleSheet("""
-            QPushButton { 
-                background-color: #00B87C; color: white; border: none; 
-                border-radius: 4px; padding: 6px 12px; font-weight: bold;
-            }
-            QPushButton:hover { background-color: #00996A; }
-        """)
+        make_evidence_btn.setStyleSheet(BTN_PRIMARY)
         make_evidence_btn.clicked.connect(self.go_to_make_evidence)
         tool_layout.addWidget(make_evidence_btn)
 
         import_btn = QPushButton("批量导入表格")
-        import_btn.setStyleSheet(common_btn_style)
+        import_btn.setStyleSheet(BTN_SECONDARY)
         import_btn.clicked.connect(self.open_import_dialog)
         tool_layout.addWidget(import_btn)
 
         del_btn = QPushButton("🗑️ 删除选中")
-        del_btn.setStyleSheet("""
-            QPushButton { 
-                background-color: #FFFFFF; color: #E74C3C; border: 1px solid #CCCCCC; 
-                border-radius: 4px; padding: 6px 12px;
-            }
-            QPushButton:hover { border-color: #E74C3C; background-color: #FFF0F0; }
-        """)
+        del_btn.setStyleSheet(BTN_DANGER_OUTLINE)
         del_btn.clicked.connect(self.delete_book)
         tool_layout.addWidget(del_btn)
 
@@ -523,43 +424,43 @@ class BooksPage(QWidget):
             ["选择", "平台ID(必填)", "作品名(必填)", "作品曾用名", "笔名", "权利人(必填)",
              "百度CP号(必填)", "维权书(必填)"])
 
+        # ★ 设置表头高度和列宽模式（与 links 保持一致）
         header = self.table.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.Stretch)
+        header.setFixedHeight(35)  # 表头高度改为 35
+
+        # 模式设定：默认固定宽度，但最后一列（维权书）自动拉伸填满右侧
+        header.setSectionResizeMode(QHeaderView.Interactive)
         header.setSectionResizeMode(0, QHeaderView.Fixed)
-        header.setSectionResizeMode(1, QHeaderView.Interactive)
-        header.setSectionResizeMode(4, QHeaderView.Interactive)
-        header.setSectionResizeMode(7, QHeaderView.Interactive)
+        header.setSectionResizeMode(7, QHeaderView.Stretch)
 
+        # 初始列宽设定
         self.table.setColumnWidth(0, 40)
-        self.table.setColumnWidth(1, 90)
-        self.table.setColumnWidth(4, 80)
-        self.table.setColumnWidth(7, 320)
+        self.table.setColumnWidth(1, 110)  # 平台ID
+        self.table.setColumnWidth(2, 180)  # 作品名
+        self.table.setColumnWidth(3, 140)  # 作品曾用名
+        self.table.setColumnWidth(4, 90)  # 笔名
+        self.table.setColumnWidth(5, 120)  # 权利人
+        self.table.setColumnWidth(6, 140)  # 百度CP号
 
-        self.table.verticalHeader().setDefaultSectionSize(38)
-        self.table.setAlternatingRowColors(True)
+        self.table.verticalHeader().setDefaultSectionSize(32)  # ★ 正文行高改窄
+        self.table.setAlternatingRowColors(False)  # ★ 取消正文交替灰底
 
-        self.table.setStyleSheet("""
-            QTableWidget {
-                background-color: #FFFFFF;
-                alternate-background-color: #F8F9FA;
-                color: #333333;
-                gridline-color: #E9ECEF;
-                outline: none;
-            }
-            QTableWidget::item {
-                margin: 0px;
-                padding: 0px;
-                border-bottom: 1px solid #E9ECEF;
-            }
-            QTableWidget::item:selected {
-                background-color: #E8F5E9;
-                color: #333333;
-            }
-        """)
+        # ★ 强制覆盖表头底纹颜色，使其与 links 页面的 #F5F5F5 完全一致
+        header_style = f"""
+            QHeaderView::section {{
+                background-color: {BG_HOVER};
+                font-weight: bold;
+                padding: 6px;
+                border: none;
+                border-bottom: 1px solid {BORDER_SOFT};
+                color: {TEXT_DARK};
+            }}
+        """
+        self.table.setStyleSheet(TABLE_BASE + header_style)
 
         self.table.setItemDelegateForColumn(0, CenteredCheckBoxDelegate(self.table))
-        self.table.setItemDelegateForColumn(1, IdDelegate(self.table))
-        self.table.setItemDelegateForColumn(6, IdDelegate(self.table))
+        self.table.setItemDelegateForColumn(1, PatternCellDelegate(parent=self.table))
+        self.table.setItemDelegateForColumn(6, PatternCellDelegate(parent=self.table))
 
         self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -571,13 +472,16 @@ class BooksPage(QWidget):
         self.table.selectionModel().selectionChanged.connect(self.on_selection_changed)
         self.table.verticalScrollBar().valueChanged.connect(self.save_scroll)
 
+        # ★ 允许表格被无限压窄，防止撑大主窗口
+        self.table.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
+
         layout.addWidget(self.table)
         self.refresh_table()
 
     def _row_ids_valid(self, row):
         for col in (1, 6):
             cell = self.table.item(row, col)
-            if cell and not IdDelegate.is_valid(cell.text()):
+            if cell and not is_alnum_only(cell.text()):
                 return False
         return True
 
@@ -641,14 +545,11 @@ class BooksPage(QWidget):
                 else:
                     ep.book_tab.book_combo.setCurrentIndex(idx)
 
-    # ==================== 新增：加号按钮 + 焦点找回 ====================
     def add_new_row(self):
-        """『➕ 新增作品』按钮：复用末尾空白行，或新加一行并聚焦。"""
         last = self.table.rowCount() - 1
         if last >= 0:
             id_item = self.table.item(last, 1)
             name_item = self.table.item(last, 2)
-            # 末尾已经是"未保存的空白行" → 不重复添加，直接聚焦
             if (id_item and not id_item.data(Qt.UserRole)
                     and name_item and not name_item.text().strip()):
                 self.table.setCurrentCell(last, 1)
@@ -659,19 +560,15 @@ class BooksPage(QWidget):
         self.table.scrollToBottom()
 
     def _focus_row_by_db_id(self, db_id):
-        """refresh_table 之后，把当前行定位到指定 db_id 的那一行。"""
         target = str(db_id)
         for r in range(self.table.rowCount()):
             item = self.table.item(r, 1)
             if item and str(item.data(Qt.UserRole)) == target:
-                self.table.setCurrentCell(r, 1)  # 定位到"平台ID"列，方便继续填
+                self.table.setCurrentCell(r, 1)
                 self.table.scrollToItem(item, QAbstractItemView.PositionAtCenter)
                 return
 
-    # ================================================================
-
     def add_blank_row(self, set_focus=False):
-        # ★ 保存现场：外层可能已处于 blockSignals / _is_updating 状态，不能冲掉
         prev_updating = self._is_updating
         prev_blocked = self.table.blockSignals(True)
         self._is_updating = True
@@ -736,7 +633,6 @@ class BooksPage(QWidget):
 
         row = item.row()
 
-        # ★ 整行任一 ID 非法 → 拒绝保存
         if not self._row_ids_valid(row):
             return
 
@@ -753,7 +649,7 @@ class BooksPage(QWidget):
         id_item = self.table.item(row, 1)
         db_id = id_item.data(Qt.UserRole) if id_item else ""
 
-        new_id = None  # ★ 记录新建时拿到的 rowid，用于 refresh 后定位
+        new_id = None
 
         conn = get_conn()
         cursor = conn.cursor()
@@ -788,7 +684,7 @@ class BooksPage(QWidget):
         if not db_id:
             self.refresh_table()
             if new_id:
-                self._focus_row_by_db_id(new_id)  # ★ 重建后定位回刚新建的那条
+                self._focus_row_by_db_id(new_id)
 
     def refresh_table(self):
         self._is_updating = True
