@@ -911,7 +911,7 @@ class LinksPage(QWidget):
         cursor = conn.cursor()
 
         # ★ 新增 source_site 和 name，name 放最后
-        query_base = ("SELECT id, target_platform, site_url, source_site, attr, feature_code, "
+        query_base = ("SELECT id, target_platform, site_url, '', attr, feature_code, "
                       "complaint_time, resource_status, book_id, book_name, crawl_status, name FROM sites")
 
         if target_cats == ["全部资源"]:
@@ -1015,7 +1015,7 @@ class LinksPage(QWidget):
                 url_item.setForeground(QColor("red"))
                 url_item.setFont(QFont("Microsoft YaHei", 9, QFont.Bold))
 
-            item_publisher = QStandardItem(record.get("source_site") or "")
+            item_publisher = QStandardItem("")
             item_publisher.setEditable(False)
 
             item_title = QStandardItem(record.get("name") or "")
